@@ -1,0 +1,8 @@
+[project]
+name = "crazyflie"
+version = "0.1.0"
+description = "Crazyflie 2.x keyboard flight controller & motor test utilities"
+requires-python = ">=3.12"
+dependencies = [
+    "cflib>=0.1.32",
+]

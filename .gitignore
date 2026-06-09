@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# cflib runtime cache
+cache/
+
+# Firmware binaries
+*.bin
+
+# IDE
+.vscode/
+.idea/
