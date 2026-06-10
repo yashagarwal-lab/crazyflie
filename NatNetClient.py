@@ -439,7 +439,7 @@ class NatNetClient:
 
                 if( len( data ) > 0 ):
                     self.__processMessage( data )
-            except (socket.timeout, OSError):
+            except OSError:
                 continue
 
     def __processMessage( self, data ):
