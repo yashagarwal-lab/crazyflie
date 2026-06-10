@@ -56,6 +56,10 @@ class NatNetClient:
         # Callback signature: callback(set_name, marker_index, position_tuple)
         self.markerSetListener = None
 
+        # Set this to a callback to receive per-labeled-marker data at each frame.
+        # Callback signature: callback(marker_id, position_tuple)
+        self.labeledMarkerListener = None
+
         # Set this to a callback method of your choice to receive per-frame data.
         self.newFrameListener = None
         
@@ -274,6 +278,10 @@ class NatNetClient:
                     residual, = FloatValue.unpack( data[offset:offset+4] )
                     offset += 4
                     trace( "Residual:", residual )
+
+                # Send information to any listener.
+                if self.labeledMarkerListener is not None:
+                    self.labeledMarkerListener( id, pos )
 
         # Force Plate data (version 2.9 and later)
         if( ( self.__natNetStreamVersion[0] == 2 and self.__natNetStreamVersion[1] >= 9 ) or self.__natNetStreamVersion[0] > 2 ):

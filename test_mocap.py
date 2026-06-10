@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-OptiTrack data validation script (marker set mode).
+OptiTrack data validation script (labeled marker mode).
 
 Connects to Motive via NatNetClient and prints position data from
-marker sets. Designed for a single-marker Crazyflie setup.
+labeled markers. Designed for a single-marker Crazyflie setup.
 
 Usage:
     python test_mocap.py
@@ -28,7 +28,7 @@ class PoseState:
     def __init__(self):
         self.lock = threading.Lock()
         self.x = self.y = self.z = 0.0
-        self.set_name = ""
+        self.marker_id = -1
         self.frame_count = 0
         self.valid = False
 
@@ -37,23 +37,16 @@ pose = PoseState()
 
 
 # ── Callback ──
-def marker_set_callback(set_name, marker_index, pos):
-    """Called by NatNetClient for each marker in each marker set per frame.
+def labeled_marker_callback(marker_id, pos):
+    """Called by NatNetClient for each labeled marker in every frame.
 
-    With a single marker on the drone, we take marker_index 0
-    from the first non-'all' marker set we see.
+    With a single marker on the drone, we take the first one we see.
     """
-    # Motive sends an 'all' set containing every marker — skip it
-    # and use the named set instead for clarity.
-    if set_name.lower() == 'all' and pose.set_name != '':
-        return
-
     with pose.lock:
-        if marker_index == 0:
-            pose.x, pose.y, pose.z = pos
-            pose.set_name = set_name
-            pose.frame_count += 1
-            pose.valid = True
+        pose.marker_id = marker_id
+        pose.x, pose.y, pose.z = pos
+        pose.frame_count += 1
+        pose.valid = True
 
 
 # ── Terminal colours ──
@@ -66,11 +59,11 @@ RESET = '\033[0m'
 
 
 def main():
-    print(f"\n{BOLD}=== OPTITRACK DATA VALIDATION (Marker Set) ==={RESET}\n")
+    print(f"\n{BOLD}=== OPTITRACK DATA VALIDATION (Labeled Marker) ==={RESET}\n")
 
     client = NatNetClient()
     # IPs already default to 127.0.0.1 (same PC as Motive)
-    client.markerSetListener = marker_set_callback
+    client.labeledMarkerListener = labeled_marker_callback
 
     print(f"  {CYAN}Server IP   :{RESET} {client.serverIPAddress}")
     print(f"  {CYAN}Local IP    :{RESET} {client.localIPAddress}")
@@ -82,12 +75,12 @@ def main():
     print(f"  Starting NatNet listener... ", end="", flush=True)
     client.run()
     print(f"{GREEN}OK{RESET}")
-    print(f"  {YELLOW}Waiting for marker set data (is Motive streaming?){RESET}")
+    print(f"  {YELLOW}Waiting for labeled marker data (is Motive streaming?){RESET}")
     print(f"  {YELLOW}Press Ctrl+C to stop.{RESET}\n")
 
     # Print header
-    print(f"  {'Set Name':>16}  {'X':>8}  {'Y':>8}  {'Z':>8}  {'Hz':>6}")
-    print(f"  {'─' * 52}")
+    print(f"  {'ID':>5}  {'X':>8}  {'Y':>8}  {'Z':>8}  {'Hz':>6}")
+    print(f"  {'─' * 42}")
 
     last_print = time.time()
     last_count = 0
@@ -112,7 +105,7 @@ def main():
 
                 x, y, z = pose.x, pose.y, pose.z
                 count = pose.frame_count
-                set_name = pose.set_name
+                marker_id = pose.marker_id
 
             # Compute receive rate (Hz)
             dt = now - last_rate_time
@@ -129,10 +122,7 @@ def main():
             else:
                 hz_str = f"   ---"
 
-            # Truncate set name for display
-            name_display = set_name[:16]
-
-            print(f"\r  {name_display:>16}  {x:>8.3f}  {y:>8.3f}  {z:>8.3f}  {hz_str}   ",
+            print(f"\r  {marker_id:>5}  {x:>8.3f}  {y:>8.3f}  {z:>8.3f}  {hz_str}   ",
                   end="", flush=True)
 
     except KeyboardInterrupt:
