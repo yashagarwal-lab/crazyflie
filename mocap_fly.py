@@ -29,6 +29,7 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.crazyflie.log import LogConfig
+from cflib.positioning.position_hl_commander import PositionHlCommander
 
 from NatNetClient import NatNetClient
 
@@ -199,56 +200,47 @@ def main():
             # Reset and configure estimator
             reset_estimator(cf)
 
-            # ── Step 4: Start telemetry ──
-            print(f"\n  {BOLD}[4] Telemetry Comparison (motors OFF){RESET}")
-            log_conf, est_state = setup_telemetry(scf)
+            # ── Step 4: Autonomous Flight ──
+            print(f"\n  {BOLD}[4] Autonomous Flight Sequence{RESET}")
+            print(f"  {YELLOW}WARNING: Ensure drone is in a safe open space!{RESET}")
+            print(f"  {YELLOW}Keep your hand over the marker to trigger safety stop if needed.{RESET}")
+            
+            try:
+                input(f"\n  {GREEN}Press ENTER to Take Off...{RESET}")
+            except KeyboardInterrupt:
+                stop_event.set()
+                natnet.stop()
+                return
 
-            print(f"  Move the drone by hand. Values should match within ~1 cm.")
-            print(f"  Press Ctrl+C to stop.\n")
-
-            # Print header
-            print(f"  {'--- OptiTrack ---':>30}  {'--- Estimator ---':>30}  {'--- Error ---':>20}")
-            print(f"  {'X':>8}  {'Y':>8}  {'Z':>8}    "
-                  f"{'X':>8}  {'Y':>8}  {'Z':>8}    "
-                  f"{'dX':>6}  {'dY':>6}  {'dZ':>6}")
-            print(f"  {'─' * 75}")
+            if stop_event.is_set():
+                print(f"  {RED}Aborting (Safety trigger activated){RESET}")
+                return
 
             try:
-                while not stop_event.is_set():
-                    time.sleep(0.1)  # 10 Hz display
+                # The PositionHlCommander takes off automatically upon entry
+                # and lands automatically upon exit.
+                with PositionHlCommander(scf, default_height=0.5, default_velocity=0.3) as pc:
+                    print(f"  Taking off to 0.5m...")
+                    
+                    # Hover in place for 5 seconds
+                    for i in range(5, 0, -1):
+                        if stop_event.is_set():
+                            print(f"  {RED}Safety stop triggered! Landing...{RESET}")
+                            break
+                        print(f"  Hovering... landing in {i}s")
+                        time.sleep(1)
 
-                    ot_x, ot_y, ot_z, _, valid = pose_state.get()
-                    if not valid:
-                        continue
-
-                    ex = est_state['x']
-                    ey = est_state['y']
-                    ez = est_state['z']
-
-                    dx = abs(ot_x - ex)
-                    dy = abs(ot_y - ey)
-                    dz = abs(ot_z - ez)
-
-                    # Colour errors: green if < 1cm, yellow if < 5cm, red otherwise
-                    def err_color(v):
-                        if v < 0.01:
-                            return f"{GREEN}{v:6.3f}{RESET}"
-                        elif v < 0.05:
-                            return f"{YELLOW}{v:6.3f}{RESET}"
-                        else:
-                            return f"{RED}{v:6.3f}{RESET}"
-
-                    print(f"\r  {ot_x:>8.3f}  {ot_y:>8.3f}  {ot_z:>8.3f}    "
-                          f"{ex:>8.3f}  {ey:>8.3f}  {ez:>8.3f}    "
-                          f"{err_color(dx)}  {err_color(dy)}  {err_color(dz)}   ",
-                          end="", flush=True)
+                    print(f"  Landing sequence initiated...")
 
             except KeyboardInterrupt:
-                pass
+                print(f"\n  {RED}Emergency Stop! Landing...{RESET}")
+                try:
+                    cf.commander.send_stop_setpoint()
+                except Exception:
+                    pass
 
-            print(f"\n\n  {YELLOW}Shutting down...{RESET}")
+            print(f"\n  {YELLOW}Shutting down threads...{RESET}")
             stop_event.set()
-            log_conf.stop()
 
     except Exception as e:
         print(f"{RED}FAILED — {e}{RESET}")
