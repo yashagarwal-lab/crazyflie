@@ -52,6 +52,10 @@ class NatNetClient:
         # Callback signature: callback(marker_index, position_tuple)
         self.unlabeledMarkerListener = None
 
+        # Set this to a callback to receive per-marker-set data at each frame.
+        # Callback signature: callback(set_name, marker_index, position_tuple)
+        self.markerSetListener = None
+
         # Set this to a callback method of your choice to receive per-frame data.
         self.newFrameListener = None
         
@@ -207,6 +211,10 @@ class NatNetClient:
                 pos = Vector3.unpack( data[offset:offset+12] )
                 offset += 12
                 #trace( "\tMarker", j, ":", pos[0],",", pos[1],",", pos[2] )
+
+                # Send information to any listener.
+                if self.markerSetListener is not None:
+                    self.markerSetListener( modelName.decode( 'utf-8' ), j, pos )
                  
         # Unlabeled markers count (4 bytes)
         unlabeledMarkersCount = int.from_bytes( data[offset:offset+4], byteorder='little' )

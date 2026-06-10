@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-OptiTrack data validation script (unlabeled marker mode).
+OptiTrack data validation script (marker set mode).
 
 Connects to Motive via NatNetClient and prints position data from
-unlabeled markers. Designed for a single-marker Crazyflie setup.
+marker sets. Designed for a single-marker Crazyflie setup.
 
 Usage:
     python test_mocap.py
@@ -28,7 +28,7 @@ class PoseState:
     def __init__(self):
         self.lock = threading.Lock()
         self.x = self.y = self.z = 0.0
-        self.marker_count = 0  # how many unlabeled markers Motive sees
+        self.set_name = ""
         self.frame_count = 0
         self.valid = False
 
@@ -37,19 +37,21 @@ pose = PoseState()
 
 
 # ── Callback ──
-def unlabeled_marker_callback(marker_index, pos):
-    """Called by NatNetClient for each unlabeled marker in every frame.
+def marker_set_callback(set_name, marker_index, pos):
+    """Called by NatNetClient for each marker in each marker set per frame.
 
-    With a single marker on the drone and nothing else in the arena,
-    marker_index 0 is the Crazyflie. If multiple markers appear,
-    we take index 0 and print a warning.
+    With a single marker on the drone, we take marker_index 0
+    from the first non-'all' marker set we see.
     """
-    with pose.lock:
-        # Track how many markers are visible this frame
-        pose.marker_count = max(pose.marker_count, marker_index + 1)
+    # Motive sends an 'all' set containing every marker — skip it
+    # and use the named set instead for clarity.
+    if set_name.lower() == 'all' and pose.set_name != '':
+        return
 
+    with pose.lock:
         if marker_index == 0:
             pose.x, pose.y, pose.z = pos
+            pose.set_name = set_name
             pose.frame_count += 1
             pose.valid = True
 
@@ -64,11 +66,11 @@ RESET = '\033[0m'
 
 
 def main():
-    print(f"\n{BOLD}=== OPTITRACK DATA VALIDATION (Unlabeled Marker) ==={RESET}\n")
+    print(f"\n{BOLD}=== OPTITRACK DATA VALIDATION (Marker Set) ==={RESET}\n")
 
     client = NatNetClient()
     # IPs already default to 127.0.0.1 (same PC as Motive)
-    client.unlabeledMarkerListener = unlabeled_marker_callback
+    client.markerSetListener = marker_set_callback
 
     print(f"  {CYAN}Server IP   :{RESET} {client.serverIPAddress}")
     print(f"  {CYAN}Local IP    :{RESET} {client.localIPAddress}")
@@ -80,13 +82,12 @@ def main():
     print(f"  Starting NatNet listener... ", end="", flush=True)
     client.run()
     print(f"{GREEN}OK{RESET}")
-    print(f"  {YELLOW}Waiting for unlabeled marker data (is Motive streaming?){RESET}")
-    print(f"  {YELLOW}Ensure the Crazyflie marker is the ONLY marker in the arena.{RESET}")
+    print(f"  {YELLOW}Waiting for marker set data (is Motive streaming?){RESET}")
     print(f"  {YELLOW}Press Ctrl+C to stop.{RESET}\n")
 
     # Print header
-    print(f"  {'X':>8}  {'Y':>8}  {'Z':>8}  {'Markers':>7}  {'Hz':>6}")
-    print(f"  {'─' * 45}")
+    print(f"  {'Set Name':>16}  {'X':>8}  {'Y':>8}  {'Z':>8}  {'Hz':>6}")
+    print(f"  {'─' * 52}")
 
     last_print = time.time()
     last_count = 0
@@ -111,9 +112,7 @@ def main():
 
                 x, y, z = pose.x, pose.y, pose.z
                 count = pose.frame_count
-                n_markers = pose.marker_count
-                # Reset for next frame's count
-                pose.marker_count = 0
+                set_name = pose.set_name
 
             # Compute receive rate (Hz)
             dt = now - last_rate_time
@@ -130,15 +129,10 @@ def main():
             else:
                 hz_str = f"   ---"
 
-            # Colour the marker count
-            if n_markers == 1:
-                mk_str = f"{GREEN}{n_markers:>7}{RESET}"
-            elif n_markers > 1:
-                mk_str = f"{RED}{n_markers:>7}{RESET}"
-            else:
-                mk_str = f"{YELLOW}{'?':>7}{RESET}"
+            # Truncate set name for display
+            name_display = set_name[:16]
 
-            print(f"\r  {x:>8.3f}  {y:>8.3f}  {z:>8.3f}  {mk_str}  {hz_str}   ",
+            print(f"\r  {name_display:>16}  {x:>8.3f}  {y:>8.3f}  {z:>8.3f}  {hz_str}   ",
                   end="", flush=True)
 
     except KeyboardInterrupt:
