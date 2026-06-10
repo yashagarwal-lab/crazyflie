@@ -51,7 +51,8 @@ class PoseState:
     def update(self, marker_id, pos):
         with self.lock:
             self.marker_id = marker_id
-            self.x, self.y, self.z = pos
+            # Remap from OptiTrack YZX to Crazyflie XYZ
+            self.y, self.z, self.x = pos
             self.last_update = time.time()
             self.valid = True
 

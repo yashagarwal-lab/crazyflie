@@ -44,7 +44,8 @@ def labeled_marker_callback(marker_id, pos):
     """
     with pose.lock:
         pose.marker_id = marker_id
-        pose.x, pose.y, pose.z = pos
+        # Remap from OptiTrack YZX to Crazyflie XYZ
+        pose.y, pose.z, pose.x = pos
         pose.frame_count += 1
         pose.valid = True
 
