@@ -91,8 +91,11 @@ def pose_injector(cf, pose_state, stop_event):
                 stop_event.set()
                 return
 
-            # Send position to the Kalman filter
-            cf.extpos.send_extpos(x, y, z)
+            # Send position + fixed heading to the Kalman filter.
+            # Identity quaternion (0,0,0,1) = facing +X direction.
+            # This acts as a yaw anchor to prevent gyro drift.
+            # IMPORTANT: Place the drone facing +X of the arena before takeoff!
+            cf.extpos.send_extpose(x, y, z, 0.0, 0.0, 0.0, 1.0)
 
         time.sleep(interval)
 
