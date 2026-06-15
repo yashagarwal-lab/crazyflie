@@ -33,7 +33,7 @@ class PoseState:
         self.valid = False
 
 
-pose = PoseState()
+pose =
 
 
 # ── Callback ──
@@ -81,7 +81,7 @@ def main():
 
     # Print header
     print(f"  {'ID':>5}  {'X':>8}  {'Y':>8}  {'Z':>8}  {'Hz':>6}")
-    print(f"  {'─' * 42}")
+    print(f"  {'-' * 42}")
 
     last_print = time.time()
     last_count = 0

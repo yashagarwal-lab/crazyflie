@@ -28,7 +28,7 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.positioning.motion_commander import MotionCommander
 
-URI = 'radio://0/80/2M/E7E7E7E701'
+URI = 'radio://0/80/2M/E7E7E7E702'
 
 # ── Flight parameters ──
 DEFAULT_HEIGHT = 0.3    # metres
