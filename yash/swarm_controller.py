@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-N-drone MoCap rigid body waypoint navigation with CBF safety.
+Backend Swarm Controller API.
 
-This module provides the `SafeSwarmController` class, which handles:
+This module provides the `SwarmController` class, which acts strictly as a hardware 
+and safety backend. It handles:
   - Connection to OptiTrack (NatNetClient).
   - Individual drone initialization and communication via `cflib`.
-  - Control Barrier Function (CBF) safety filtering for workspace bounds and inter-drone separation.
-  - Interactive terminal mode for manual testing using a static curses UI.
+  - Control Barrier Function (CBF) safety filtering for absolute workspace bounds.
 """
 
 import time
 import threading
 import logging
-import curses
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.crazyflie.log import LogConfig
 from NatNetClient import NatNetClient
 from pynput import keyboard
 
 from core.pid import PID, clamp
-from core.grid import GRID, print_grid
 from core.cbf import CBFSafetyFilter
 
 logging.basicConfig(level=logging.ERROR)
@@ -30,10 +29,8 @@ MAX_SPEED        = 0.3
 LOOP_HZ          = 50
 EXTPOS_HZ        = 100
 MAX_ALTITUDE     = 1.8
-ARRIVAL_RADIUS   = 0.08
-COLLISION_RADIUS = 0.15
-HEIGHT_TOLERANCE = 0.3    
-AVOID_OFFSET     = 0.5    
+BATTERY_THRESHOLD = 3.2    # Auto-land if voltage drops below this
+MOCAP_TIMEOUT    = 1.5     # Seconds to hover without MoCap before landing
 
 # ── Cylindrical workspace (CBF enforced) ──────────────────────────────────────
 WORKSPACE_RADIUS = 1.25   
@@ -42,8 +39,6 @@ WORKSPACE_Z_MIN  = 0.05
 CBF_D_MIN        = 0.3    
 CBF_ALPHA_BOUND  = 1.0    
 CBF_ALPHA_SEP    = 0.8    
-MARKER_TIMEOUT   = 0.5    
-SOFT_RADIUS      = 1.0    
 
 # ── Hard emergency kill radii ─────────────────────────────────────────────────
 HARD_KILL_R      = 1.55   
@@ -51,29 +46,28 @@ HARD_KILL_Z      = 2.0
 
 
 class Drone:
-    def __init__(self, number, marker_id, default_z, controller, kp_xy=0.6, ki_xy=0.05, kd_xy=0.15, kp_z=0.8, ki_z=0.08, kd_z=0.20):
-        self.number    = number
-        self.name      = f"Drone{number}"
-        self.uri       = f"radio://0/80/2M/E7E7E7E70{number}"
-        self.marker_id = marker_id
-        self.default_z = default_z
-        self.cache     = f"./cache{number}"
+    def __init__(self, config, controller, kp_xy=0.6, ki_xy=0.05, kd_xy=0.15, kp_z=0.8, ki_z=0.08, kd_z=0.20):
+        self.number    = config['number']
+        self.name      = f"Drone{self.number}"
+        self.uri       = config.get('uri', f"radio://0/80/2M/E7E7E7E70{self.number}")
+        self.marker_id = config['marker_id']
+        self.default_z = config['default_z']
+        self.cache     = f"./cache{self.number}"
         self.controller = controller
 
+        # State Variables
         self.pose_lock   = threading.Lock()
         self.x = self.y = self.z = 0.0
         self.pose_valid  = False
         self.last_update = 0.0
+        self.battery     = 4.2
+        self.state       = "INIT"
 
         self.nav_lock       = threading.Lock()
         self.target_x       = 0.0
         self.target_y       = 0.0
-        self.target_z       = default_z
+        self.target_z       = self.default_z
         self.should_land    = False
-        self.waypoint_queue = []
-
-        self.home_x = 0.0
-        self.home_y = 0.0
 
         self.pid_x = PID(kp_xy, ki_xy, kd_xy)
         self.pid_y = PID(kp_xy, ki_xy, kd_xy)
@@ -97,40 +91,61 @@ class Drone:
         with self.pose_lock:
             return time.time() - self.last_update if self.last_update > 0 else float('inf')
 
-    def set_target(self, x, y, z, queue=None):
+    def set_target(self, x, y, z):
         with self.nav_lock:
+            # PID reset if jumping to a faraway target to clear integral windup
+            dist = ((self.target_x - x)**2 + (self.target_y - y)**2 + (self.target_z - z)**2)**0.5
+            if dist > 0.2:
+                self.reset_pids()
             self.target_x = x
             self.target_y = y
             self.target_z = z
-            self.waypoint_queue = queue if queue else []
 
     def get_nav(self):
         with self.nav_lock:
-            return (self.target_x, self.target_y, self.target_z, self.should_land, list(self.waypoint_queue))
+            return (self.target_x, self.target_y, self.target_z, self.should_land)
 
-    def advance_waypoint(self):
+    def is_arrived(self, radius=0.08):
+        with self.pose_lock:
+            cx, cy, cz = self.x, self.y, self.z
+            valid = self.pose_valid
         with self.nav_lock:
-            if self.waypoint_queue:
-                wp = self.waypoint_queue.pop(0)
-                self.target_x, self.target_y, self.target_z = wp
-                return wp
-        return None
+            tx, ty, tz = self.target_x, self.target_y, self.target_z
+        if not valid: return False
+        return ((tx-cx)**2 + (ty-cy)**2 + (tz-cz)**2)**0.5 < radius
 
     def reset_pids(self):
-        self.pid_x.reset(); self.pid_y.reset(); self.pid_z.reset()
+        self.pid_x.reset()
+        self.pid_y.reset()
+        self.pid_z.reset()
+
+    def _battery_callback(self, timestamp, data, logconf):
+        voltage = data.get('pm.vbat', 4.2)
+        self.battery = float(voltage)
+        if self.battery < BATTERY_THRESHOLD and self.state == "FLYING":
+            self.controller.log(f"[{self.name}] LOW BATTERY ({self.battery:.2f}V) - Auto Landing!")
+            self.controller.fire_event("low_battery", self.number, {"voltage": self.battery})
+            with self.nav_lock:
+                self.should_land = True
 
     def run_extpos(self, scf, stop_ep):
         dt = 1.0 / EXTPOS_HZ
         while not stop_ep.is_set():
             t0 = time.time()
             x, y, z, valid = self.get_pose()
-            if valid:
+            age = self.get_pose_age()
+            
+            # Only send extpos if we have fresh MoCap data. 
+            # If stale, we stop sending so the EKF relies purely on IMU.
+            if valid and age < 0.2:
                 scf.cf.extpos.send_extpos(x, y, z)
+            
             elapsed = time.time() - t0
             time.sleep(max(0, dt - elapsed))
 
     def takeoff(self, scf):
         cf = scf.cf
+        self.state = "TAKEOFF"
         self.controller.log(f"[{self.name}] Taking off to z={self.default_z}m ...")
         for _ in range(10):
             cf.commander.send_velocity_world_setpoint(0, 0, 0, 0)
@@ -157,6 +172,7 @@ class Drone:
 
     def land(self, scf):
         cf = scf.cf
+        self.state = "LANDING"
         self.controller.log(f"[{self.name}] Descending...")
         _, _, cz, _ = self.get_pose()
         while cz > 0.10:
@@ -174,12 +190,22 @@ class Drone:
             cf.param.set_value('stabilizer.estimator', '1')
         except Exception:
             pass
+        self.state = "LANDED"
         self.controller.log(f"[{self.name}] Landed.")
 
     def flight_loop(self, scf):
         cf = scf.cf
 
+        # 1. Setup Battery Logging
+        log_conf = LogConfig(name='Battery', period_in_ms=1000)
+        log_conf.add_variable('pm.vbat', 'float')
+        scf.cf.log.add_config(log_conf)
+        log_conf.data_received_cb.add_callback(self._battery_callback)
+        log_conf.start()
+
+        # 2. Setup Estimator and Controller
         cf.param.set_value('stabilizer.estimator', '2')
+        cf.param.set_value('stabilizer.controller', '2') # 2 = Mellinger Controller
         time.sleep(0.5)
         try: cf.param.set_value('flowdeck.useFlow', '0')
         except Exception: pass
@@ -196,43 +222,49 @@ class Drone:
         self.controller.log(f"[{self.name}] EKF reset. Waiting for convergence...")
         time.sleep(1.5)
 
+        # 3. Takeoff
         if not self.takeoff(scf) or self.controller.kill_event.is_set():
             stop_ep.set()
             return
 
         self.reset_pids()
-        self.controller.log(f"[{self.name}] Ready for waypoints.")
+        self.state = "FLYING"
+        self.controller.log(f"[{self.name}] Ready.")
+        
         dt = 1.0 / LOOP_HZ
+        was_arrived = False
 
+        # 4. Main Flight Loop
         try:
             while not self.stop_event.is_set() and not self.controller.kill_event.is_set():
                 loop_start = time.time()
 
-                tx, ty, tz, should_land, queue = self.get_nav()
+                tx, ty, tz, should_land = self.get_nav()
                 if should_land:
                     break
 
                 cx, cy, cz, got_data = self.get_pose()
-                queue_len = len(queue)
+                age = self.get_pose_age()
 
-                if got_data and self.get_pose_age() > MARKER_TIMEOUT:
-                    self.controller.log(f"[{self.name}] !! MARKER LOST for >{MARKER_TIMEOUT}s — AUTO LANDING !!")
+                # Handle MoCap Occlusion Gracefully (relies on EKF IMU for 1.5s)
+                if age > MOCAP_TIMEOUT:
+                    self.controller.log(f"[{self.name}] !! MOCAP LOST > {MOCAP_TIMEOUT}s — AUTO LANDING !!")
+                    self.controller.fire_event("mocap_lost", self.number, {})
                     with self.nav_lock:
                         self.should_land = True
                     break
 
+                # Hard Boundary Failsafe
                 if (cx**2 + cy**2) > HARD_KILL_R**2 or cz > HARD_KILL_Z:
                     self.controller.log(f"[{self.name}] !! HARD BOUNDARY BREACH pos=({cx:+.3f},{cy:+.3f},{cz:+.3f}) — KILLING !!")
                     self.controller.kill_event.set()
                     break
 
-                if not got_data:
+                # Short Occlusion: Send zero velocity and let EKF IMU handle hover
+                if age > 0.2:
                     cf.commander.send_velocity_world_setpoint(0, 0, 0, 0)
                     time.sleep(dt)
                     continue
-
-                # SOFT_RADIUS 'return home' logic removed.
-                # The CBF filter will now naturally hold the drone at the boundary constraint.
 
                 now = time.time()
                 ex, ey, ez = tx - cx, ty - cy, tz - cz
@@ -255,14 +287,11 @@ class Drone:
 
                 cf.commander.send_velocity_world_setpoint(vx, vy, vz, 0)
 
-                dist    = (ex**2 + ey**2 + ez**2) ** 0.5
-                arrived = dist < ARRIVAL_RADIUS
-
-                if arrived and queue_len > 0:
-                    wp = self.advance_waypoint()
-                    if wp:
-                        self.controller.log(f"[{self.name}] Waypoint reached — next ({wp[0]:+.3f},{wp[1]:+.3f},{wp[2]:+.3f})")
-                        self.reset_pids()
+                # Fire event once upon reaching target
+                currently_arrived = self.is_arrived()
+                if currently_arrived and not was_arrived:
+                    self.controller.fire_event("arrived", self.number, {"pos": (cx, cy, cz)})
+                was_arrived = currently_arrived
 
                 elapsed = time.time() - loop_start
                 time.sleep(max(0, dt - elapsed))
@@ -270,23 +299,31 @@ class Drone:
         except Exception as e:
             self.controller.log(f"[{self.name}] Flight loop error: {e}")
 
+        # 5. Landing / Kill
         if self.controller.kill_event.is_set():
             cf.commander.send_stop_setpoint()
+            self.state = "KILLED"
             self.controller.log(f"[{self.name}] Motors killed instantly.")
         else:
             self.land(scf)
 
+        log_conf.stop()
         stop_ep.set()
 
 
-class SafeSwarmController:
-    def __init__(self, drone_configs):
+class SwarmController:
+    def __init__(self, drone_configs, logging_callback=None, event_callback=None):
+        """
+        drone_configs: List of dicts specifying drone configs.
+        logging_callback: function(str) to pipe hardware logs back to your UI planner.
+        event_callback: function(event_name, drone_number, data)
+        """
         self.kill_event = threading.Event()
         self.drones = []
         self.drone_by_num = {}
         self.marker_to_drone = {}
-        self.messages = []
-        self.msg_lock = threading.Lock()
+        self.logging_callback = logging_callback
+        self.event_callback = event_callback
         
         self.cbf_filter = CBFSafetyFilter(
             radius=WORKSPACE_RADIUS,
@@ -300,9 +337,7 @@ class SafeSwarmController:
 
         for cfg in drone_configs:
             d = Drone(
-                number=cfg['number'],
-                marker_id=cfg['marker_id'],
-                default_z=cfg['default_z'],
+                config=cfg,
                 controller=self,
                 kp_xy=cfg.get('kp_xy', 0.6), ki_xy=cfg.get('ki_xy', 0.05), kd_xy=cfg.get('kd_xy', 0.15),
                 kp_z=cfg.get('kp_z', 0.8), ki_z=cfg.get('ki_z', 0.08), kd_z=cfg.get('kd_z', 0.20)
@@ -316,49 +351,18 @@ class SafeSwarmController:
         self.mocap_client = None
 
     def log(self, msg):
-        """Store logs for the curses UI."""
-        with self.msg_lock:
-            self.messages.append(msg)
-            if len(self.messages) > 10:
-                self.messages.pop(0)
+        if self.logging_callback:
+            self.logging_callback(msg)
+        else:
+            print(msg)
+
+    def fire_event(self, event_name, drone_number, data):
+        if self.event_callback:
+            self.event_callback(event_name, drone_number, data)
 
     def receive_rigid_body_frame(self, rb_id, position, rotation):
         if rb_id in self.marker_to_drone:
             self.marker_to_drone[rb_id].update_pose(position)
-
-    def _path_conflicts(self, sx, sy, tx, ty, ox, oy, radius):
-        dx, dy = tx - sx, ty - sy
-        seg_sq = dx*dx + dy*dy
-        if seg_sq == 0:
-            return ((ox-sx)**2 + (oy-sy)**2) ** 0.5 < radius
-        t  = max(0.0, min(1.0, ((ox-sx)*dx + (oy-sy)*dy) / seg_sq))
-        cx = sx + t*dx
-        cy = sy + t*dy
-        return ((ox-cx)**2 + (oy-cy)**2) ** 0.5 < radius
-
-    def _plan_path(self, moving_drone, target_x, target_y, target_z):
-        cx, cy, cz, _ = moving_drone.get_pose()
-        worst_z = None
-
-        for drone in self.drones:
-            if drone is moving_drone:
-                continue
-            ox, oy, oz, _ = drone.get_pose()
-            conflict       = self._path_conflicts(cx, cy, target_x, target_y, ox, oy, COLLISION_RADIUS)
-            height_similar = abs(cz - oz) < HEIGHT_TOLERANCE
-            if conflict and height_similar:
-                if worst_z is None or oz > worst_z:
-                    worst_z = oz
-
-        if worst_z is None:
-            return [(target_x, target_y, target_z)], False
-
-        avoid_z = min(worst_z + AVOID_OFFSET, MAX_ALTITUDE - 0.1)
-        return [
-            (cx,       cy,       avoid_z),
-            (target_x, target_y, avoid_z),
-            (target_x, target_y, target_z),
-        ], True
 
     def on_press(self, key):
         if hasattr(key, 'char') and key.char == '\x18':
@@ -388,17 +392,15 @@ class SafeSwarmController:
         print("  [OK] Sanity check passed — proceeding to flight.\n")
         return True
 
-    def start(self, interactive=False):
+    def start(self, interactive=True):
         n = len(self.drones)
-        print(f"\n[INIT]   {n} drone(s) initialized.")
-        if interactive:
-            print_grid()
+        self.log(f"\n[INIT]   {n} drone(s) initialized.")
 
-        print("[MoCap]  Connecting to Motive NatNet...")
+        self.log("[MoCap]  Connecting to Motive NatNet...")
         self.mocap_client = NatNetClient()
         self.mocap_client.rigidBodyListener = self.receive_rigid_body_frame
         self.mocap_client.run()
-        print("[MoCap]  Waiting for all rigid bodies...")
+        self.log("[MoCap]  Waiting for all rigid bodies...")
 
         timeout = time.time() + 10.0
         while True:
@@ -406,11 +408,11 @@ class SafeSwarmController:
             if not missing:
                 break
             if time.time() > timeout:
-                print(f"[MoCap]  ERROR: Cannot see: {missing}")
+                self.log(f"[MoCap]  ERROR: Cannot see: {missing}")
                 self.mocap_client.stop()
                 return False
             time.sleep(0.05)
-        print("[MoCap]  All rigid bodies found!")
+        self.log("[MoCap]  All rigid bodies found!")
 
         if interactive and not self.sanity_check():
             self.mocap_client.stop()
@@ -418,21 +420,31 @@ class SafeSwarmController:
 
         for drone in self.drones:
             x, y, _, _ = drone.get_pose()
-            drone.home_x = x
-            drone.home_y = y
             drone.set_target(x, y, drone.default_z)
-            print(f"[NAV]    {drone.name} home: x={x:+.3f} y={y:+.3f} z={drone.default_z}")
+            self.log(f"[NAV]    {drone.name} targeting home: x={x:+.3f} y={y:+.3f} z={drone.default_z}")
 
         cflib.crtp.init_drivers()
-        print("[CF]     Connecting to all drones...")
+        self.log("[CF]     Connecting to all drones (Max 3 retries)...")
         self.start_kill_listener()
 
         try:
+            # Connect with retry logic
             for drone in self.drones:
-                scf = SyncCrazyflie(drone.uri, cf=Crazyflie(rw_cache=drone.cache))
-                scf.open_link()
-                self.scf_list.append(scf)
-            print(f"[CF]     All {n} drones connected!\n")
+                connected = False
+                for attempt in range(3):
+                    try:
+                        scf = SyncCrazyflie(drone.uri, cf=Crazyflie(rw_cache=drone.cache))
+                        scf.open_link()
+                        self.scf_list.append(scf)
+                        connected = True
+                        break
+                    except Exception as e:
+                        self.log(f"[CF]     {drone.name} connection failed (Attempt {attempt+1}): {e}")
+                        time.sleep(1.0)
+                if not connected:
+                    raise Exception(f"Failed to connect to {drone.name} after 3 attempts.")
+
+            self.log(f"[CF]     All {n} drones connected!\n")
 
             for drone, scf in zip(self.drones, self.scf_list):
                 t = threading.Thread(target=drone.flight_loop, args=(scf,), daemon=True)
@@ -443,7 +455,7 @@ class SafeSwarmController:
             return True
 
         except Exception as e:
-            print(f"[CF]     Connection error: {e}")
+            self.log(f"[CF]     Fatal Connection error: {e}")
             self.stop_all()
             return False
 
@@ -453,6 +465,7 @@ class SafeSwarmController:
             try:
                 scf.cf.commander.send_stop_setpoint()
                 scf.cf.param.set_value('stabilizer.estimator', '1')
+                scf.cf.param.set_value('stabilizer.controller', '1')
             except Exception: pass
         for scf in self.scf_list:
             try: scf.close_link()
@@ -472,160 +485,41 @@ class SafeSwarmController:
                 self.drone_by_num[drone_number].should_land = True
             self.log(f"[NAV] Landing Drone{drone_number}.")
 
-    def goto_grid(self, drone_number, grid_number, z):
-        if drone_number not in self.drone_by_num: return False
-        if grid_number not in GRID: return False
-        tx, ty = GRID[grid_number]
-        return self.goto_point(drone_number, tx, ty, z, grid_num=grid_number)
-
-    def goto_point(self, drone_number, x, y, z, grid_num=None):
+    def goto_point(self, drone_number, x, y, z):
+        """Pure coordinate targeting."""
         if drone_number not in self.drone_by_num: return False
         if z > MAX_ALTITUDE or z < 0.1: return False
-
-        moving = self.drone_by_num[drone_number]
-        waypoints, avoided = self._plan_path(moving, x, y, z)
-
-        if avoided:
-            self.log(f"[AVOID] Drone{drone_number} path conflict detected")
-            self.log(f"[AVOID] Steps: climb to z={waypoints[0][2]:.2f}m, then fly, then descend.")
         
-        target_desc = f"Grid {grid_num}" if grid_num else f"Point ({x:+.3f},{y:+.3f})"
-        self.log(f"[NAV] Drone{drone_number} → {target_desc} at z={z}m")
-
-        moving.set_target(waypoints[0][0], waypoints[0][1], waypoints[0][2], queue=waypoints[1:])
+        self.drone_by_num[drone_number].set_target(x, y, z)
         return True
 
-    def go_home(self, drone_number):
-        if drone_number in self.drone_by_num:
-            d = self.drone_by_num[drone_number]
-            d.set_target(d.home_x, d.home_y, d.default_z)
-            self.log(f"[NAV] Drone{drone_number} → Home ({d.home_x:+.3f},{d.home_y:+.3f},{d.default_z})")
+    def is_arrived(self, drone_number, radius=0.08):
+        if drone_number not in self.drone_by_num: return False
+        return self.drone_by_num[drone_number].is_arrived(radius)
 
-    def process_command(self, raw):
-        parts = raw.split()
-        if not parts: return
-        
-        if parts[0].lower() == "land":
-            if len(parts) == 1: self.land_all()
-            elif len(parts) == 2:
-                try: self.land(int(parts[1]))
-                except ValueError: self.log("[ERR] Usage: land or land <n>")
-            return
+    def get_state(self):
+        """Returns a list of dicts with current state for external planners/UIs."""
+        state = []
+        for drone in self.drones:
+            cx, cy, cz, valid = drone.get_pose()
+            with drone.nav_lock:
+                tx, ty, tz = drone.target_x, drone.target_y, drone.target_z
+            state.append({
+                'number': drone.number,
+                'name': drone.name,
+                'pos': (cx, cy, cz) if valid else None,
+                'target': (tx, ty, tz),
+                'battery': drone.battery,
+                'state': drone.state,
+                'arrived': drone.is_arrived()
+            })
+        return state
 
-        if len(parts) == 2 and parts[1].lower() == "home":
-            try: self.go_home(int(parts[0]))
-            except ValueError: self.log("[ERR] Usage: <n> home")
-            return
+    def all_landed(self):
+        return len(self.flight_threads) > 0 and all(not t.is_alive() for t in self.flight_threads)
 
-        if len(parts) == 3:
-            try:
-                dn = int(parts[0])
-                grid_num = int(parts[1])
-                tz = float(parts[2])
-                if not self.goto_grid(dn, grid_num, tz):
-                    self.log("[ERR] Invalid command. Check drone number, grid number, or height.")
-            except ValueError:
-                self.log("[ERR] Usage: <n> <grid> <z> (e.g. 1 13 0.5)")
-            return
-
-        self.log(f"[ERR] Unknown command: {raw}")
-
-    def _curses_ui(self, stdscr):
-        curses.curs_set(1)  # Show cursor for input
-        stdscr.nodelay(True)
-        stdscr.timeout(100) # 10Hz refresh
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)
-        curses.init_pair(2, curses.COLOR_RED, -1)
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)
-        curses.init_pair(4, curses.COLOR_CYAN, -1)
-
-        input_str = ""
-
-        while True:
-            # Check exit conditions
-            if self.kill_event.is_set():
-                self.log("Emergency kill engaged! Exiting interactive terminal.")
-                time.sleep(1.0)
-                break
-                
-            all_landed = all(not t.is_alive() for t in self.flight_threads)
-            if all_landed and len(self.flight_threads) > 0:
-                self.log("All drones landed. Exiting interactive terminal.")
-                time.sleep(1.0)
-                break
-
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-
-            # --- HEADER ---
-            stdscr.addstr(0, 0, "=== Safe Swarm Interactive Terminal ===", curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(1, 0, "Commands:  <n> <grid> <z> | <n> home | land | land <n> | Ctrl+C to quit")
-            
-            # --- DRONE STATUS ---
-            row = 3
-            for drone in self.drones:
-                cx, cy, cz, valid = drone.get_pose()
-                with drone.nav_lock:
-                    tx, ty, tz = drone.target_x, drone.target_y, drone.target_z
-                    q = len(drone.waypoint_queue)
-                dist = ((tx-cx)**2 + (ty-cy)**2 + (tz-cz)**2) ** 0.5
-                nearest = min(GRID.items(), key=lambda g: (g[1][0]-cx)**2 + (g[1][1]-cy)**2)[0]
-                
-                status_color = curses.color_pair(1) if valid else curses.color_pair(2)
-                pos_str = f"({cx:+.2f}, {cy:+.2f}, {cz:+.2f})" if valid else "( NO MOCAP )"
-                tgt_str = f"Grid{nearest:>2} ({tx:+.2f}, {ty:+.2f}, {tz:+.2f})"
-                
-                info = f"[{drone.name}] Pos: {pos_str:20} Tgt: {tgt_str:20} Dist: {dist:.2f}m  Q: {q}"
-                if row < h - 4:
-                    stdscr.addstr(row, 0, info, status_color)
-                row += 1
-
-            # --- LOGS ---
-            row += 1
-            if row < h - 4:
-                stdscr.addstr(row, 0, "--- Event Log ---", curses.color_pair(3))
-                row += 1
-                with self.msg_lock:
-                    # show last messages fitting in screen
-                    msgs = self.messages[-(h - row - 3):] if h - row - 3 > 0 else []
-                    for msg in msgs:
-                        stdscr.addstr(row, 0, msg[:w-1])
-                        row += 1
-
-            # --- INPUT PROMPT ---
-            prompt_row = h - 1
-            stdscr.addstr(prompt_row, 0, f"> {input_str}")
-            
-            stdscr.move(prompt_row, 2 + len(input_str))
-            stdscr.refresh()
-
-            # Handle Input
-            try:
-                key = stdscr.getch()
-                if key != -1:
-                    if key in (curses.KEY_ENTER, 10, 13):
-                        if input_str.strip():
-                            self.process_command(input_str.strip())
-                        input_str = ""
-                    elif key in (curses.KEY_BACKSPACE, 127, 8):
-                        input_str = input_str[:-1]
-                    elif 32 <= key <= 126:
-                        input_str += chr(key)
-            except KeyboardInterrupt:
-                break
-            except Exception:
-                pass
-
-    def run_interactive(self):
-        try:
-            curses.wrapper(self._curses_ui)
-        except Exception as e:
-            print(f"Curses UI failed: {e}")
-        
-        # Wait for flight threads to finish landing
-        print("\n[CTRL] Graceful landing all drones...")
+    def wait_for_landing(self):
+        self.log("\n[CTRL] Waiting for drones to land...")
         for drone in self.drones:
             drone.stop_event.set()
             
@@ -641,15 +535,3 @@ class SafeSwarmController:
             t.join(timeout=5)
 
         self.stop_all()
-
-
-if __name__ == '__main__':
-    drone_configs = [
-        {'number': 1, 'marker_id': 351, 'default_z': 0.5},
-        # {'number': 2, 'marker_id': 352, 'default_z': 0.5},
-    ]
-
-    controller = SafeSwarmController(drone_configs)
-    
-    if controller.start(interactive=True):
-        controller.run_interactive()
