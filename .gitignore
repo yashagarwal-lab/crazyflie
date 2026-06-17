@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 
 # cflib runtime cache
-cache/
+cache*/
 
 # Firmware binaries
 *.bin
