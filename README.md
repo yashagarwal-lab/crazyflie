@@ -2,34 +2,21 @@
 
 Keyboard-based flight controller and motor test utilities for the Crazyflie 2.x quadcopter using [cflib](https://github.com/bitcraze/crazyflie-lib-python).
 
-## Setup
 
-```bash
-# Install udev rules (Linux)
-sudo cp 99-bitcraze.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
+## Collaboration & Git Workflow
 
-# Install dependencies
-uv sync
-```
+Yash and Nathan work in their respective directories (`yash/` and `nathan/`) to avoid merge conflicts.
 
-## Usage
-
-```bash
-# Test individual motors (remove propellers first!)
-uv run python motor_test.py
-
-# Fly with keyboard
-uv run python fly.py
-```
-
-## Controls (fly.py)
-
-| Key | Action |
-|---|---|
-| ↑ / ↓ | Thrust up / down |
-| W / S | Pitch forward / back |
-| A / D | Roll left / right |
-| Q / E | Yaw left / right |
-| Space | Kill motors |
-| Esc | Land & quit |
+### Daily Git Cheat Sheet
+1. **Get the latest updates:**
+   ```bash
+   git pull origin main
+   ```
+2. **Work on your code** e.g. - in `/nathan/` or `/yash/` folders.
+3. **Save and share your updates:**
+   ```bash
+   git add nathan/
+   git commit -m "nathan: <describe your changes>"
+   git push origin main
+   ```
+*(Using `git add nathan/` or `git add yash/` ensures you only upload your own files.)*
