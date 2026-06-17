@@ -49,11 +49,11 @@ GRID = {
 }
 
 # ── Config ───────────────────────────────────────────────────────────────────
-DRONE1_URI      = "radio://0/80/2M/E7E7E7E704"
-DRONE2_URI      = "radio://0/80/2M/E7E7E7E702"
+DRONE1_URI      = "radio://0/80/2M/E7E7E7E703"
+DRONE2_URI      = "radio://0/80/2M/E7E7E7E704"
 
-DRONE1_MARKER   = 354
-DRONE2_MARKER   = 51328
+DRONE1_MARKER   = 50008
+DRONE2_MARKER   = 50013
 
 DRONE1_TARGET_Z =  0.5
 DRONE2_TARGET_Z =  1.0

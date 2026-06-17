@@ -42,12 +42,12 @@ from pynput import keyboard
 logging.basicConfig(level=logging.ERROR)
 
 # ── Config ───────────────────────────────────────────────────────────────────
-DRONE1_URI      = "radio://0/80/2M/E7E7E7E701"
-DRONE2_URI      = "radio://0/80/2M/E7E7E7E702"
+DRONE1_URI      = "radio://0/80/2M/E7E7E7E703"
+DRONE2_URI      = "radio://0/80/2M/E7E7E7E704"
 
 # Run scan.py before every flight to confirm these IDs
-DRONE1_MARKER   = 50130
-DRONE2_MARKER   = 50135
+DRONE1_MARKER   = 50002
+DRONE2_MARKER   = 50009
 
 # Initial hover height — XY is auto-set from MoCap ground position at startup
 DRONE1_TARGET_Z =  0.25      # 50 cm
