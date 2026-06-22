@@ -19,7 +19,8 @@ from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.crazyflie.log import LogConfig
 from NatNetClient import NatNetClient
 from pynput import keyboard
-from core.pid import PID, clamp
+from core.state import DroneState
+from core.pipeline import MellingerController, CBFSafetyWrapper, CBFSafetyFilter
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -31,11 +32,11 @@ BATTERY_THRESHOLD = 3.2
 MOCAP_TIMEOUT    = 1.5
 
 # ── Workspace limits ──────────────────────────────────────────────────────────
-WORKSPACE_RADIUS = 1.25
-WORKSPACE_Z_MAX  = 1.8
+WORKSPACE_RADIUS = 1.5
+WORKSPACE_Z_MAX  = 2.0
 WORKSPACE_Z_MIN  = 0.05
-HARD_KILL_R      = 1.55
-HARD_KILL_Z      = 2.0
+HARD_KILL_R      = 1.7
+HARD_KILL_Z      = 2.2
 
 # ── Controller registry ──────────────────────────────────────────────────────
 CONTROLLERS = {
@@ -57,59 +58,63 @@ class Drone:
         self.controller = controller
 
         # Controller mode
-        ctrl_name = config.get('controller', 'pid')
+        ctrl_name = config.get('controller', 'mellinger')
         ctrl_info = CONTROLLERS.get(ctrl_name, CONTROLLERS['pid'])
         self.ctrl_param = ctrl_info['param']
         self.ctrl_mode  = ctrl_info['mode']  # 'velocity' or 'position'
         self.ctrl_name  = ctrl_name
 
-        # State
-        self.pose_lock   = threading.Lock()
-        self.x = self.y = self.z = 0.0
-        self.pose_valid  = False
-        self.last_update = 0.0
-        self.battery     = 4.2
-        self.state       = "INIT"
+        # State (Modular)
+        self.drone_state = DroneState()
 
+        # Navigation state
         self.nav_lock    = threading.Lock()
         self.target_x    = 0.0
         self.target_y    = 0.0
         self.target_z    = self.default_z
+        self.target_yaw  = 0.0
         self.should_land = False
 
-        # Position mode: interpolated setpoint
-        self.setpoint_x = 0.0
-        self.setpoint_y = 0.0
-        self.setpoint_z = 0.0
-
-        # Velocity mode: PID controllers
-        self.pid_x = PID(0.6, 0.05, 0.15)
-        self.pid_y = PID(0.6, 0.05, 0.15)
-        self.pid_z = PID(0.8, 0.08, 0.20)
+        # Flight Pipeline
+        # By default, use Mellinger Controller
+        base_controller = MellingerController(max_speed=MAX_SPEED)
+        
+        # If config requests CBF, wrap it
+        if config.get('use_cbf', False):
+            cbf_filter = CBFSafetyFilter(
+                v_max=MAX_SPEED, 
+                r_safe=0.3, # Collision radius
+                workspace_radius=WORKSPACE_RADIUS,
+                z_min=WORKSPACE_Z_MIN,
+                z_max=WORKSPACE_Z_MAX
+            )
+            self.pipeline = CBFSafetyWrapper(
+                base_controller, 
+                cbf_filter, 
+                lambda: [d.drone_state for d in self.controller.drones]
+            )
+        else:
+            self.pipeline = base_controller
 
         self.stop_event = threading.Event()
 
     # ── Pose ──────────────────────────────────────────────────────────────
-    def update_pose(self, position):
-        with self.pose_lock:
-            self.x, self.y, self.z = position[2], position[0], position[1]
-            self.pose_valid  = True
-            self.last_update = time.time()
+    def update_pose(self, position, rotation):
+        self.drone_state.update_pose(position, rotation)
 
     def get_pose(self):
-        with self.pose_lock:
-            return self.x, self.y, self.z, self.pose_valid
+        return self.drone_state.get_pose()
+
+    def get_orientation(self):
+        with self.drone_state.lock:
+            return self.drone_state.qx, self.drone_state.qy, self.drone_state.qz, self.drone_state.qw
 
     def get_pose_age(self):
-        with self.pose_lock:
-            return time.time() - self.last_update if self.last_update > 0 else float('inf')
+        return self.drone_state.get_pose_age()
 
     # ── Nav ───────────────────────────────────────────────────────────────
     def set_target(self, x, y, z):
         with self.nav_lock:
-            dist = ((self.target_x-x)**2 + (self.target_y-y)**2 + (self.target_z-z)**2)**0.5
-            if dist > 0.2:
-                self.pid_x.reset(); self.pid_y.reset(); self.pid_z.reset()
             self.target_x, self.target_y, self.target_z = x, y, z
 
     def get_nav(self):
@@ -117,7 +122,7 @@ class Drone:
             return (self.target_x, self.target_y, self.target_z, self.should_land)
 
     def is_arrived(self, radius=0.08):
-        cx, cy, cz, valid = self.get_pose()
+        cx, cy, cz, _, _, _, _, valid = self.get_pose()
         with self.nav_lock:
             tx, ty, tz = self.target_x, self.target_y, self.target_z
         # Clamp target to workspace for arrival check
@@ -130,10 +135,10 @@ class Drone:
     # ── Battery ───────────────────────────────────────────────────────────
     def _battery_callback(self, timestamp, data, logconf):
         voltage = data.get('pm.vbat', 4.2)
-        self.battery = float(voltage)
-        if self.battery < BATTERY_THRESHOLD and self.state == "FLYING":
-            self.controller.log(f"[{self.name}] LOW BATTERY ({self.battery:.2f}V) - Auto Landing!")
-            self.controller.fire_event("low_battery", self.number, {"voltage": self.battery})
+        self.drone_state.battery = float(voltage)
+        if self.drone_state.battery < BATTERY_THRESHOLD and self.drone_state.status == "FLYING":
+            self.controller.log(f"[{self.name}] LOW BATTERY ({self.drone_state.battery:.2f}V) - Auto Landing!")
+            self.controller.fire_event("low_battery", self.number, {"voltage": self.drone_state.battery})
             with self.nav_lock:
                 self.should_land = True
 
@@ -142,35 +147,38 @@ class Drone:
         dt = 1.0 / EXTPOS_HZ
         while not stop_ep.is_set():
             t0 = time.time()
-            x, y, z, valid = self.get_pose()
+            x, y, z, qx, qy, qz, qw, valid = self.get_pose()
             if valid and self.get_pose_age() < 0.2:
-                scf.cf.extpos.send_extpos(x, y, z)
+                scf.cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
             time.sleep(max(0, dt - (time.time() - t0)))
 
     # ── Takeoff ───────────────────────────────────────────────────────────
     def takeoff(self, scf):
         cf = scf.cf
-        self.state = "TAKEOFF"
-        self.controller.log(f"[{self.name}] Taking off ({self.ctrl_name}) to z={self.default_z}m ...")
-        cx, cy, cz, _ = self.get_pose()
+        self.drone_state.status = "TAKEOFF"
+        cx, cy, cz, _, _, _, _, _ = self.get_pose()
+        cyaw = self.drone_state.get_yaw()
+        with self.nav_lock:
+            self.target_yaw = cyaw
+        self.controller.log(f"[{self.name}] Taking off ({self.ctrl_name}) to z={self.default_z}m, yaw={cyaw:.1f}deg...")
         ramp_dt = 0.02
         start = time.time()
 
         if self.ctrl_mode == 'position':
-            self.setpoint_x, self.setpoint_y = cx, cy
-            self.setpoint_z = max(0.05, cz)
+            self.pipeline.setpoint_x, self.pipeline.setpoint_y = cx, cy
+            self.pipeline.setpoint_z = max(0.05, cz)
             for _ in range(10):
-                cf.commander.send_position_setpoint(self.setpoint_x, self.setpoint_y, self.setpoint_z, 0)
+                cf.commander.send_position_setpoint(self.pipeline.setpoint_x, self.pipeline.setpoint_y, self.pipeline.setpoint_z, 0)
                 time.sleep(ramp_dt)
-            while self.setpoint_z < self.default_z:
+            while self.pipeline.setpoint_z < self.default_z:
                 if self.controller.kill_event.is_set():
                     cf.commander.send_stop_setpoint(); return False
-                _, _, az, _ = self.get_pose()
+                _, _, az, _, _, _, _, _ = self.get_pose()
                 if az > HARD_KILL_Z:
                     self.controller.kill_event.set(); cf.commander.send_stop_setpoint(); return False
                 if time.time() - start > 8.0: break
-                self.setpoint_z = min(self.setpoint_z + MAX_SPEED * ramp_dt, self.default_z)
-                cf.commander.send_position_setpoint(self.setpoint_x, self.setpoint_y, self.setpoint_z, 0)
+                self.pipeline.setpoint_z = min(self.pipeline.setpoint_z + MAX_SPEED * ramp_dt, self.default_z)
+                cf.commander.send_position_setpoint(self.pipeline.setpoint_x, self.pipeline.setpoint_y, self.pipeline.setpoint_z, 0)
                 time.sleep(ramp_dt)
         else:  # velocity mode
             for _ in range(10):
@@ -179,7 +187,7 @@ class Drone:
             while True:
                 if self.controller.kill_event.is_set():
                     cf.commander.send_stop_setpoint(); return False
-                _, _, cz, _ = self.get_pose()
+                _, _, cz, _, _, _, _, _ = self.get_pose()
                 if cz > HARD_KILL_Z:
                     self.controller.kill_event.set(); cf.commander.send_stop_setpoint(); return False
                 if cz >= self.default_z * 0.90: break
@@ -193,25 +201,21 @@ class Drone:
     # ── Land ──────────────────────────────────────────────────────────────
     def land(self, scf):
         cf = scf.cf
-        self.state = "LANDING"
+        self.drone_state.status = "LANDING"
         self.controller.log(f"[{self.name}] Descending...")
         ramp_dt = 0.02
 
-        if self.ctrl_mode == 'position':
-            while self.setpoint_z > 0.05:
-                if self.controller.kill_event.is_set(): break
-                cx, cy, _, _ = self.get_pose()
-                self.setpoint_x, self.setpoint_y = cx, cy
-                self.setpoint_z = max(self.setpoint_z - 0.2 * ramp_dt, 0.0)
-                cf.commander.send_position_setpoint(self.setpoint_x, self.setpoint_y, self.setpoint_z, 0)
-                time.sleep(ramp_dt)
-        else:
-            _, _, cz, _ = self.get_pose()
-            while cz > 0.10:
-                if self.controller.kill_event.is_set(): break
-                cf.commander.send_velocity_world_setpoint(0, 0, -0.2, 0)
-                time.sleep(0.05)
-                _, _, cz, _ = self.get_pose()
+        _, _, cz, _, _, _, _, _ = self.get_pose()
+        while cz > 0.10:
+            if self.controller.kill_event.is_set(): break
+            
+            self.pipeline.setpoint_z = max(self.pipeline.setpoint_z - 0.2 * ramp_dt, 0.0)
+            sz = self.pipeline.setpoint_z
+            sx = self.pipeline.setpoint_x
+            sy = self.pipeline.setpoint_y
+            cf.commander.send_position_setpoint(sx, sy, sz, 0)
+            time.sleep(0.05)
+            _, _, cz, _, _, _, _, _ = self.get_pose()
 
         cf.commander.send_stop_setpoint()
         time.sleep(0.3)
@@ -222,7 +226,7 @@ class Drone:
             cf.param.set_value('stabilizer.controller', '1')
             cf.param.set_value('stabilizer.estimator', '1')
         except Exception: pass
-        self.state = "LANDED"
+        self.drone_state.status = "LANDED"
         self.controller.log(f"[{self.name}] Landed.")
 
     # ── Flight Loop ───────────────────────────────────────────────────────
@@ -256,11 +260,10 @@ class Drone:
         if not self.takeoff(scf) or self.controller.kill_event.is_set():
             stop_ep.set(); return
 
-        self.state = "FLYING"
+        self.drone_state.status = "FLYING"
         self.controller.log(f"[{self.name}] Ready — {self.ctrl_name} active.")
         dt = 1.0 / LOOP_HZ
         was_arrived = False
-        self.pid_x.reset(); self.pid_y.reset(); self.pid_z.reset()
 
         try:
             while not self.stop_event.is_set() and not self.controller.kill_event.is_set():
@@ -268,71 +271,34 @@ class Drone:
                 tx, ty, tz, should_land = self.get_nav()
                 if should_land: break
 
-                cx, cy, cz, got_data = self.get_pose()
+                cx, cy, cz, qx, qy, qz, qw, got_data = self.get_pose()
                 age = self.get_pose_age()
 
                 if age > MOCAP_TIMEOUT:
-                    self.controller.log(f"[{self.name}] MOCAP LOST — AUTO LANDING")
-                    self.controller.fire_event("mocap_lost", self.number, {})
-                    with self.nav_lock: self.should_land = True
-                    break
+                    self.controller.log(f"[{self.name}] MoCap timeout ({age:.1f}s) -> HOVERING")
+                    cf.commander.send_hover_setpoint(0, 0, 0, cz)
+                    self.controller.fire_event("mocap_lost", self.number, {'age': age})
+                    time.sleep(dt); continue
 
                 if (cx**2+cy**2) > HARD_KILL_R**2 or cz > HARD_KILL_Z:
                     self.controller.log(f"[{self.name}] HARD BOUNDARY — KILLING")
                     self.controller.kill_event.set(); break
 
                 if age > 0.2:
-                    if self.ctrl_mode == 'position':
-                        cf.commander.send_position_setpoint(self.setpoint_x, self.setpoint_y, self.setpoint_z, 0)
-                    else:
-                        cf.commander.send_velocity_world_setpoint(0, 0, 0, 0)
+                    cf.commander.send_hover_setpoint(0, 0, 0, cz)
                     time.sleep(dt); continue
 
-                if self.ctrl_mode == 'position':
-                    # Interpolate setpoint toward target
-                    ex, ey, ez = tx - self.setpoint_x, ty - self.setpoint_y, tz - self.setpoint_z
-                    dist = math.sqrt(ex**2 + ey**2 + ez**2)
-                    step = MAX_SPEED * dt
-                    if dist > step:
-                        self.setpoint_x += (ex/dist)*step
-                        self.setpoint_y += (ey/dist)*step
-                        self.setpoint_z += (ez/dist)*step
-                    else:
-                        self.setpoint_x, self.setpoint_y, self.setpoint_z = tx, ty, tz
-
-                    # Anti-windup clamp
-                    dd = math.sqrt((self.setpoint_x-cx)**2+(self.setpoint_y-cy)**2+(self.setpoint_z-cz)**2)
-                    if dd > 0.3:
-                        s = 0.3/dd
-                        self.setpoint_x = cx+(self.setpoint_x-cx)*s
-                        self.setpoint_y = cy+(self.setpoint_y-cy)*s
-                        self.setpoint_z = cz+(self.setpoint_z-cz)*s
-
-                    # Boundary clamp
-                    r = math.sqrt(self.setpoint_x**2+self.setpoint_y**2)
-                    if r > WORKSPACE_RADIUS:
-                        self.setpoint_x *= WORKSPACE_RADIUS/r
-                        self.setpoint_y *= WORKSPACE_RADIUS/r
-                    self.setpoint_z = max(WORKSPACE_Z_MIN, min(self.setpoint_z, WORKSPACE_Z_MAX))
-
-                    cf.commander.send_position_setpoint(self.setpoint_x, self.setpoint_y, self.setpoint_z, 0)
-
-                else:  # velocity mode
-                    now = time.time()
-                    ex, ey, ez = tx - cx, ty - cy, tz - cz
-                    vx = clamp(self.pid_x.update(ex, now), MAX_SPEED)
-                    vy = clamp(self.pid_y.update(ey, now), MAX_SPEED)
-                    vz = clamp(self.pid_z.update(ez, now), MAX_SPEED)
-
-                    # Boundary clamp on velocity
-                    r = math.sqrt(cx**2+cy**2)
-                    if r > WORKSPACE_RADIUS * 0.95:
-                        dot = cx*vx + cy*vy
-                        if dot > 0: vx, vy = 0.0, 0.0
-                    if cz > WORKSPACE_Z_MAX * 0.95 and vz > 0: vz = 0.0
-                    if cz < WORKSPACE_Z_MIN + 0.02 and vz < 0: vz = 0.0
-
-                    cf.commander.send_velocity_world_setpoint(vx, vy, vz, 0)
+                # Use Modular Pipeline
+                setpoint = self.pipeline.compute(self.drone_state, (tx, ty, tz), self.target_yaw, dt)
+                
+                # Boundary clamp on setpoint
+                r = math.sqrt(setpoint.x**2 + setpoint.y**2)
+                if r > WORKSPACE_RADIUS:
+                    setpoint.x *= WORKSPACE_RADIUS/r
+                    setpoint.y *= WORKSPACE_RADIUS/r
+                setpoint.z = max(WORKSPACE_Z_MIN, min(setpoint.z, WORKSPACE_Z_MAX))
+                
+                cf.commander.send_position_setpoint(setpoint.x, setpoint.y, setpoint.z, setpoint.yaw)
 
                 # Arrival event
                 currently_arrived = self.is_arrived()
@@ -383,7 +349,7 @@ class SwarmController:
 
     def receive_rigid_body_frame(self, rb_id, position, rotation):
         if rb_id in self.marker_to_drone:
-            self.marker_to_drone[rb_id].update_pose(position)
+            self.marker_to_drone[rb_id].update_pose(position, rotation)
 
     def on_press(self, key):
         if hasattr(key, 'char') and key.char == '\x18':
@@ -400,8 +366,9 @@ class SwarmController:
         print("  ║         PRE-FLIGHT SANITY CHECK          ║")
         print("  ╚══════════════════════════════════════════╝\n")
         for drone in self.drones:
-            x, y, z, _ = drone.get_pose()
-            print(f"  {drone.name} ({drone.ctrl_name})  x={x:+.3f}  y={y:+.3f}  z={z:+.3f}")
+            x, y, z, _, _, _, _, _ = drone.get_pose()
+            yaw = drone.drone_state.get_yaw()
+            print(f"  {drone.name} ({drone.ctrl_name})  x={x:+.3f}  y={y:+.3f}  z={z:+.3f}  yaw={yaw:+.1f}deg")
         print("\n  Z should be ~0.0 (floor). Confirm positions match physical drones.\n")
         if input("  All correct? (yes/no): ").strip().lower() != 'yes':
             print("\n  [ABORT]\n"); return False
@@ -429,7 +396,7 @@ class SwarmController:
             self.mocap_client.stop(); return False
 
         for drone in self.drones:
-            x, y, _, _ = drone.get_pose()
+            x, y, _, _, _, _, _, _ = drone.get_pose()
             drone.set_target(x, y, drone.default_z)
 
         cflib.crtp.init_drivers()
@@ -493,13 +460,14 @@ class SwarmController:
     def get_state(self):
         state = []
         for d in self.drones:
-            cx, cy, cz, valid = d.get_pose()
+            cx, cy, cz, qx, qy, qz, qw, valid = d.get_pose()
+            cyaw = d.drone_state.get_yaw()
             with d.nav_lock: tx, ty, tz = d.target_x, d.target_y, d.target_z
             state.append({
                 'number': d.number, 'name': d.name,
-                'pos': (cx, cy, cz) if valid else None,
-                'target': (tx, ty, tz), 'battery': d.battery,
-                'state': d.state, 'arrived': d.is_arrived(),
+                'pos': (cx, cy, cz, cyaw) if valid else None,
+                'target': (tx, ty, tz), 'battery': d.drone_state.battery,
+                'state': d.drone_state.status, 'arrived': d.is_arrived(),
                 'controller': d.ctrl_name,
             })
         return state

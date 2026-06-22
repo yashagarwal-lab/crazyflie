@@ -7,8 +7,8 @@ the target coordinates before they reach the backend.
 """
 import math
 
-WORKSPACE_RADIUS = 1.25
-WORKSPACE_Z_MAX  = 1.8
+WORKSPACE_RADIUS = 1.5
+WORKSPACE_Z_MAX  = 2.0
 WORKSPACE_Z_MIN  = 0.05
 
 

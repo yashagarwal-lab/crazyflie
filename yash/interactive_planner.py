@@ -63,7 +63,7 @@ def curses_ui(stdscr, controller, avoider, formation_mgr):
         row = 3
         for d in controller.get_state():
             valid = d['pos'] is not None
-            cx, cy, cz = d['pos'] if valid else (0, 0, 0)
+            cx, cy, cz, cyaw = d['pos'] if valid else (0, 0, 0, 0)
             tx, ty, tz = d['target']
             batt, state, arrived = d['battery'], d['state'], d['arrived']
             ctrl = d.get('controller', '?')
@@ -72,7 +72,7 @@ def curses_ui(stdscr, controller, avoider, formation_mgr):
             color = curses.color_pair(2) if not valid or state == "KILLED" else \
                     curses.color_pair(3) if batt < 3.4 else curses.color_pair(1)
             st = "[ARRIVED]" if arrived and state == "FLYING" else f"[{state}]"
-            pos = f"({cx:+.2f},{cy:+.2f},{cz:+.2f})" if valid else "(NO MOCAP)"
+            pos = f"({cx:+.2f},{cy:+.2f},{cz:+.2f}) y={cyaw:+.0f}°" if valid else "(NO MOCAP)"
             info = f"[{d['name']}|{ctrl}] {batt:.2f}V {st:10} {pos} -> ({tx:+.2f},{ty:+.2f},{tz:+.2f}) d={dist:.2f}"
             if row < h - 4: stdscr.addstr(row, 0, info[:w-1], color)
             row += 1
@@ -212,8 +212,8 @@ def run_experiment(controller, avoider):
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     drone_configs = [
-        {'number': 1, 'marker_id': 351, 'default_z': 0.5, 'controller': 'pid'},
-        # {'number': 2, 'marker_id': 352, 'default_z': 0.5, 'controller': 'pid'},
+        {'number': 1, 'marker_id': 351, 'default_z': 0.5, 'controller': 'mellinger', 'use_cbf': True},
+        # {'number': 2, 'marker_id': 352, 'default_z': 0.5, 'controller': 'mellinger', 'use_cbf': True},
     ]
 
     controller = SwarmController(drone_configs, logging_callback=logging_callback, event_callback=event_callback)

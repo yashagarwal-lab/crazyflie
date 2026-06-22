@@ -22,6 +22,17 @@ from pynput import keyboard
 from core.pid import PID, clamp
 from core.grid import GRID, print_grid
 from core.cbf import CBFSafetyFilter
+import math
+
+def quat_to_yaw(qx, qy, qz, qw):
+    siny_cosp = 2.0 * (qw * qy + qz * qx)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.degrees(math.atan2(siny_cosp, cosy_cosp))
+
+def wrap_angle(angle):
+    while angle >  180.0: angle -= 360.0
+    while angle < -180.0: angle += 360.0
+    return angle
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -62,6 +73,9 @@ class Drone:
 
         self.pose_lock   = threading.Lock()
         self.x = self.y = self.z = 0.0
+        self.qx = self.qy = self.qz = 0.0
+        self.qw = 1.0
+        self.yaw = 0.0
         self.pose_valid  = False
         self.last_update = 0.0
 
@@ -69,29 +83,43 @@ class Drone:
         self.target_x       = 0.0
         self.target_y       = 0.0
         self.target_z       = default_z
+        self.target_yaw     = 0.0
         self.should_land    = False
         self.waypoint_queue = []
 
         self.home_x = 0.0
         self.home_y = 0.0
+        self.home_yaw = 0.0
 
         self.pid_x = PID(kp_xy, ki_xy, kd_xy)
         self.pid_y = PID(kp_xy, ki_xy, kd_xy)
         self.pid_z = PID(kp_z,  ki_z,  kd_z)
+        self.pid_yaw = PID(2.0, 0.05, 0.1, integral_limit=30.0)
 
         self.stop_event = threading.Event()
 
-    def update_pose(self, position):
+    def update_pose(self, position, rotation):
+        qx, qy, qz, qw = rotation
+        yaw = quat_to_yaw(qx, qy, qz, qw)
         with self.pose_lock:
             self.x = position[2]
             self.y = position[0]
             self.z = position[1]
+            self.qx = qx
+            self.qy = qy
+            self.qz = qz
+            self.qw = qw
+            self.yaw = yaw
             self.pose_valid  = True
             self.last_update = time.time()
 
     def get_pose(self):
         with self.pose_lock:
-            return self.x, self.y, self.z, self.pose_valid
+            return self.x, self.y, self.z, self.yaw, self.pose_valid
+
+    def get_orientation(self):
+        with self.pose_lock:
+            return self.qx, self.qy, self.qz, self.qw
 
     def get_pose_age(self):
         with self.pose_lock:
@@ -106,7 +134,7 @@ class Drone:
 
     def get_nav(self):
         with self.nav_lock:
-            return (self.target_x, self.target_y, self.target_z, self.should_land, list(self.waypoint_queue))
+            return (self.target_x, self.target_y, self.target_z, self.target_yaw, self.should_land, list(self.waypoint_queue))
 
     def advance_waypoint(self):
         with self.nav_lock:
@@ -117,21 +145,25 @@ class Drone:
         return None
 
     def reset_pids(self):
-        self.pid_x.reset(); self.pid_y.reset(); self.pid_z.reset()
+        self.pid_x.reset(); self.pid_y.reset(); self.pid_z.reset(); self.pid_yaw.reset()
 
     def run_extpos(self, scf, stop_ep):
         dt = 1.0 / EXTPOS_HZ
         while not stop_ep.is_set():
             t0 = time.time()
-            x, y, z, valid = self.get_pose()
+            x, y, z, _, valid = self.get_pose()
+            qx, qy, qz, qw = self.get_orientation()
             if valid:
-                scf.cf.extpos.send_extpos(x, y, z)
+                scf.cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
             elapsed = time.time() - t0
             time.sleep(max(0, dt - elapsed))
 
     def takeoff(self, scf):
         cf = scf.cf
-        self.controller.log(f"[{self.name}] Taking off to z={self.default_z}m ...")
+        _, _, cz, cyaw, _ = self.get_pose()
+        with self.nav_lock:
+            self.target_yaw = cyaw
+        self.controller.log(f"[{self.name}] Taking off to z={self.default_z}m, yaw={cyaw:.1f}deg...")
         for _ in range(10):
             cf.commander.send_velocity_world_setpoint(0, 0, 0, 0)
             time.sleep(0.01)
@@ -140,7 +172,7 @@ class Drone:
             if self.controller.kill_event.is_set():
                 cf.commander.send_stop_setpoint()
                 return False
-            _, _, cz, _ = self.get_pose()
+            _, _, cz, _, _ = self.get_pose()
             if cz > MAX_ALTITUDE:
                 self.controller.log(f"[{self.name}] ALTITUDE LIMIT HIT DURING TAKEOFF — killing!")
                 self.controller.kill_event.set()
@@ -158,13 +190,13 @@ class Drone:
     def land(self, scf):
         cf = scf.cf
         self.controller.log(f"[{self.name}] Descending...")
-        _, _, cz, _ = self.get_pose()
+        _, _, cz, _, _ = self.get_pose()
         while cz > 0.10:
             if self.controller.kill_event.is_set():
                 break
             cf.commander.send_velocity_world_setpoint(0, 0, -0.2, 0)
             time.sleep(0.05)
-            _, _, cz, _ = self.get_pose()
+            _, _, cz, _, _ = self.get_pose()
         cf.commander.send_stop_setpoint()
         time.sleep(0.3)
         try:
@@ -208,11 +240,11 @@ class Drone:
             while not self.stop_event.is_set() and not self.controller.kill_event.is_set():
                 loop_start = time.time()
 
-                tx, ty, tz, should_land, queue = self.get_nav()
+                tx, ty, tz, target_yaw, should_land, queue = self.get_nav()
                 if should_land:
                     break
 
-                cx, cy, cz, got_data = self.get_pose()
+                cx, cy, cz, cyaw, got_data = self.get_pose()
                 queue_len = len(queue)
 
                 if got_data and self.get_pose_age() > MARKER_TIMEOUT:
@@ -241,10 +273,13 @@ class Drone:
                 vy = clamp(self.pid_y.update(ey, now), MAX_SPEED)
                 vz = clamp(self.pid_z.update(ez, now), MAX_SPEED)
 
+                yaw_error = wrap_angle(target_yaw - cyaw)
+                yaw_rate_cmd = clamp(self.pid_yaw.update(yaw_error, now), 100.0)
+
                 other_poses = []
                 for d in self.controller.drones:
                     if d is not self:
-                        ox, oy, oz, _ = d.get_pose()
+                        ox, oy, oz, _, _ = d.get_pose()
                         other_poses.append((ox, oy, oz))
                         
                 vx, vy, vz = self.controller.cbf_filter.filter(
@@ -253,7 +288,7 @@ class Drone:
                     other_positions=other_poses,
                 )
 
-                cf.commander.send_velocity_world_setpoint(vx, vy, vz, 0)
+                cf.commander.send_velocity_world_setpoint(vx, vy, vz, yaw_rate_cmd)
 
                 dist    = (ex**2 + ey**2 + ez**2) ** 0.5
                 arrived = dist < ARRIVAL_RADIUS
@@ -324,7 +359,7 @@ class SafeSwarmController:
 
     def receive_rigid_body_frame(self, rb_id, position, rotation):
         if rb_id in self.marker_to_drone:
-            self.marker_to_drone[rb_id].update_pose(position)
+            self.marker_to_drone[rb_id].update_pose(position, rotation)
 
     def _path_conflicts(self, sx, sy, tx, ty, ox, oy, radius):
         dx, dy = tx - sx, ty - sy
@@ -337,13 +372,13 @@ class SafeSwarmController:
         return ((ox-cx)**2 + (oy-cy)**2) ** 0.5 < radius
 
     def _plan_path(self, moving_drone, target_x, target_y, target_z):
-        cx, cy, cz, _ = moving_drone.get_pose()
+        cx, cy, cz, _, _ = moving_drone.get_pose()
         worst_z = None
 
         for drone in self.drones:
             if drone is moving_drone:
                 continue
-            ox, oy, oz, _ = drone.get_pose()
+            ox, oy, oz, _, _ = drone.get_pose()
             conflict       = self._path_conflicts(cx, cy, target_x, target_y, ox, oy, COLLISION_RADIUS)
             height_similar = abs(cz - oz) < HEIGHT_TOLERANCE
             if conflict and height_similar:
@@ -375,9 +410,9 @@ class SafeSwarmController:
         print("  ║         PRE-FLIGHT SANITY CHECK          ║")
         print("  ╚══════════════════════════════════════════╝\n")
         for drone in self.drones:
-            x, y, z, _ = drone.get_pose()
+            x, y, z, yaw, _ = drone.get_pose()
             print(f"  {drone.name} (marker {drone.marker_id})  "
-                  f"x={x:+.3f}  y={y:+.3f}  z={z:+.3f}  (height={z:.3f}m)")
+                  f"x={x:+.3f}  y={y:+.3f}  z={z:+.3f}  yaw={yaw:+.1f}deg")
         print()
         print("  Z values should all be close to 0.0 (floor level).")
         print("  Confirm each position matches where that drone is physically sitting.\n")
@@ -417,11 +452,14 @@ class SafeSwarmController:
             return False
 
         for drone in self.drones:
-            x, y, _, _ = drone.get_pose()
+            x, y, _, yaw, _ = drone.get_pose()
             drone.home_x = x
             drone.home_y = y
+            drone.home_yaw = yaw
             drone.set_target(x, y, drone.default_z)
-            print(f"[NAV]    {drone.name} home: x={x:+.3f} y={y:+.3f} z={drone.default_z}")
+            with drone.nav_lock:
+                drone.target_yaw = yaw
+            print(f"[NAV]    {drone.name} home: x={x:+.3f} y={y:+.3f} z={drone.default_z} yaw={yaw:+.1f}deg")
 
         cflib.crtp.init_drivers()
         print("[CF]     Connecting to all drones...")
@@ -566,7 +604,7 @@ class SafeSwarmController:
             # --- DRONE STATUS ---
             row = 3
             for drone in self.drones:
-                cx, cy, cz, valid = drone.get_pose()
+                cx, cy, cz, cyaw, valid = drone.get_pose()
                 with drone.nav_lock:
                     tx, ty, tz = drone.target_x, drone.target_y, drone.target_z
                     q = len(drone.waypoint_queue)
