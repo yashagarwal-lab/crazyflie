@@ -3,8 +3,8 @@ import math
 import threading
 
 def quat_to_yaw(qx, qy, qz, qw):
-    # Standard yaw (rotation around Z) from quaternion in a Z-up frame
-    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    # Yaw from raw Optitrack quaternion (Y-up frame, rotation around Y)
+    siny_cosp = 2.0 * (qw * qy + qz * qx)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.degrees(math.atan2(siny_cosp, cosy_cosp))
 
@@ -34,13 +34,13 @@ class DroneState:
         opti_qx, opti_qy, opti_qz, opti_qw = rotation
         with self.lock:
             # Map Optitrack (X, Y_up, Z) -> Crazyflie (Z, X, Y_up)
-            # Position mapping: CF_x = Opti_z, CF_y = Opti_x, CF_z = Opti_y
             self.x, self.y, self.z = position[2], position[0], position[1]
             
-            # Quaternion mapping must match position mapping exactly!
-            self.qx = opti_qz
-            self.qy = opti_qx
-            self.qz = opti_qy
+            # Store raw Optitrack quaternion — the EKF handles the frame
+            # (matches proven 3m_bounds.py behavior)
+            self.qx = opti_qx
+            self.qy = opti_qy
+            self.qz = opti_qz
             self.qw = opti_qw
             self.pose_valid = True
             self.last_update = time.time()
