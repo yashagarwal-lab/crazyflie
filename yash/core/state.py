@@ -3,7 +3,8 @@ import math
 import threading
 
 def quat_to_yaw(qx, qy, qz, qw):
-    siny_cosp = 2.0 * (qw * qy + qz * qx)
+    # Standard yaw (rotation around Z) from quaternion in a Z-up frame
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.degrees(math.atan2(siny_cosp, cosy_cosp))
 
@@ -30,9 +31,17 @@ class DroneState:
         self.status = "INIT"
         
     def update_pose(self, position, rotation):
+        opti_qx, opti_qy, opti_qz, opti_qw = rotation
         with self.lock:
+            # Map Optitrack (X, Y_up, Z) -> Crazyflie (Z, X, Y_up)
+            # Position mapping: CF_x = Opti_z, CF_y = Opti_x, CF_z = Opti_y
             self.x, self.y, self.z = position[2], position[0], position[1]
-            self.qx, self.qy, self.qz, self.qw = rotation
+            
+            # Quaternion mapping must match position mapping exactly!
+            self.qx = opti_qz
+            self.qy = opti_qx
+            self.qz = opti_qy
+            self.qw = opti_qw
             self.pose_valid = True
             self.last_update = time.time()
             

@@ -173,7 +173,7 @@ class Drone:
             self.pipeline.setpoint_x, self.pipeline.setpoint_y = cx, cy
             self.pipeline.setpoint_z = max(0.05, cz)
             for _ in range(10):
-                cf.commander.send_position_setpoint(self.pipeline.setpoint_x, self.pipeline.setpoint_y, self.pipeline.setpoint_z, 0)
+                cf.commander.send_position_setpoint(self.pipeline.setpoint_x, self.pipeline.setpoint_y, self.pipeline.setpoint_z, self.target_yaw)
                 time.sleep(ramp_dt)
             while self.pipeline.setpoint_z < self.default_z:
                 if self.controller.kill_event.is_set():
@@ -183,7 +183,7 @@ class Drone:
                     self.controller.kill_event.set(); cf.commander.send_stop_setpoint(); return False
                 if time.time() - start > 8.0: break
                 self.pipeline.setpoint_z = min(self.pipeline.setpoint_z + MAX_SPEED * ramp_dt, self.default_z)
-                cf.commander.send_position_setpoint(self.pipeline.setpoint_x, self.pipeline.setpoint_y, self.pipeline.setpoint_z, 0)
+                cf.commander.send_position_setpoint(self.pipeline.setpoint_x, self.pipeline.setpoint_y, self.pipeline.setpoint_z, self.target_yaw)
                 time.sleep(ramp_dt)
         else:  # velocity mode
             for _ in range(10):
@@ -218,7 +218,7 @@ class Drone:
             sz = self.pipeline.setpoint_z
             sx = self.pipeline.setpoint_x
             sy = self.pipeline.setpoint_y
-            cf.commander.send_position_setpoint(sx, sy, sz, 0)
+            cf.commander.send_position_setpoint(sx, sy, sz, self.target_yaw)
             time.sleep(0.05)
             _, _, cz, _, _, _, _, _ = self.get_pose()
 
