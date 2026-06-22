@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-N-drone MoCap rigid body waypoint navigation.
-No flow deck required — position comes from OptiTrack rigid bodies.
-
-Drones always face +X axis direction.
+N-drone MoCap rigid body waypoint navigation with yaw hold.
+No flow deck required — position and heading from OptiTrack rigid bodies.
 
 HOW TO USE:
-  1. In the ACTIVE DRONES section below, comment/uncomment which drones to fly.
-  2. Run the script — it auto-detects how many are active.
-  3. Each drone's PID gains can be tuned individually in its Drone(...) definition.
+  1. Place drones in any orientation — each holds its initial heading automatically.
+  2. In the ACTIVE DRONES section below, comment/uncomment which drones to fly.
+  3. Run the script — it auto-detects how many are active.
+  4. Each drone's PID gains can be tuned individually in its Drone(...) definition.
 
 Controls:
   CTRL+X         — Emergency kill ALL drones instantly
@@ -17,19 +16,20 @@ Controls:
 Terminal commands (mid-flight):
   <n> <grid> <z> — send drone N to grid position at height z  (e.g. 1 13 0.5)
   <n> home       — drone N return to its physical takeoff spot
-  status         — print all drones position and target
+  status         — print all drones position, heading and target
   grid           — print the full grid map
   land           — graceful land all drones
   land <n>       — graceful land drone N only
 
 Obstacle avoidance:
-  When a drone's path passes through any other drone at similar height,
+  When a drone path passes through any other drone at similar height,
   the moving drone automatically:
     Step 1 — climbs to blocking drone height + AVOID_OFFSET at current XY
     Step 2 — flies to target XY at avoid height
     Step 3 — descends to target height at target XY
 """
 
+import math
 import time
 import threading
 import logging
@@ -52,13 +52,13 @@ GRID = {
 
 # ── Global flight parameters ──────────────────────────────────────────────────
 MAX_SPEED        = 0.3
+MAX_YAW_RATE     = 100.0   # deg/s — max yaw correction rate
 LOOP_HZ          = 50
 EXTPOS_HZ        = 100
-MAX_ALTITUDE     = 1.75
 ARRIVAL_RADIUS   = 0.08
 COLLISION_RADIUS = 0.15
-HEIGHT_TOLERANCE = 0.3    # z diff below which avoidance triggers
-AVOID_OFFSET     = 0.5    # climb this much above the blocking drone
+HEIGHT_TOLERANCE = 0.3     # z diff below which avoidance triggers
+AVOID_OFFSET     = 0.5     # climb this much above the blocking drone
 
 # ── Flight volume clamps — edit these 6 values to resize the allowed cube ─────
 # Commanded waypoints are clamped to this volume before being sent to the drone.
@@ -107,19 +107,41 @@ def clamp_target(x, y, z):
             max(CLAMP_Y_MIN, min(CLAMP_Y_MAX, y)),
             max(CLAMP_Z_MIN, min(CLAMP_Z_MAX, z)))
 
+def quat_to_yaw(qx, qy, qz, qw):
+    """
+    Extract yaw (rotation around world Z axis) from quaternion.
+    Returns yaw in degrees, range -180..+180.
+    NatNet quaternion convention: (qx, qy, qz, qw).
+    """
+    # Remap NatNet axes to world frame same as position:
+    # NatNet x->world y, NatNet y->world z, NatNet z->world x
+    # For yaw we only need the world-Z component of rotation
+    siny_cosp = 2.0 * (qw * qy + qz * qx)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    yaw_rad   = math.atan2(siny_cosp, cosy_cosp)
+    return math.degrees(yaw_rad)
+
+def wrap_angle(angle):
+    """Wrap angle to -180..+180 degrees."""
+    while angle >  180.0: angle -= 360.0
+    while angle < -180.0: angle += 360.0
+    return angle
+
 # ── Drone class ───────────────────────────────────────────────────────────────
 class Drone:
     def __init__(self,
                  number,
                  marker_id,
                  default_z,
-                 kp_xy=0.6, ki_xy=0.05, kd_xy=0.15,
-                 kp_z=0.8,  ki_z=0.08,  kd_z=0.20):
+                 kp_xy=0.6,  ki_xy=0.05,  kd_xy=0.15,
+                 kp_z=0.8,   ki_z=0.08,   kd_z=0.20,
+                 kp_yaw=2.0, ki_yaw=0.05, kd_yaw=0.1):
         """
         number    : drone number (1-based, matches terminal command prefix)
         marker_id : Motive rigid body streaming ID  (350 + number by convention)
         default_z : hover height in metres
         kp/ki/kd  : PID gains — tune per drone if needed
+        kp/ki/kd_yaw : yaw PID — output is deg/s yaw rate sent to drone
         """
         self.number    = number
         self.name      = f"Drone{number}"
@@ -131,6 +153,9 @@ class Drone:
         # ── Pose (filled by NatNet callback) ──────────────────────────────────
         self.pose_lock  = threading.Lock()
         self.x = self.y = self.z = 0.0
+        self.yaw        = 0.0    # degrees, world frame
+        self.qx = self.qy = self.qz = 0.0
+        self.qw         = 1.0
         self.pose_valid = False
 
         # ── Nav state ─────────────────────────────────────────────────────────
@@ -138,32 +163,47 @@ class Drone:
         self.target_x       = 0.0
         self.target_y       = 0.0
         self.target_z       = default_z
+        self.target_yaw     = None   # set to home yaw on takeoff
         self.should_land    = False
-        self.waypoint_queue = []   # list of (x, y, z)
+        self.waypoint_queue = []     # list of (x, y, z)
 
-        self.home_x = 0.0
-        self.home_y = 0.0
+        self.home_x   = 0.0
+        self.home_y   = 0.0
+        self.home_yaw = None         # captured at startup, held throughout
 
         # ── Per-drone PID controllers ─────────────────────────────────────────
-        self.pid_x = PID(kp_xy, ki_xy, kd_xy)
-        self.pid_y = PID(kp_xy, ki_xy, kd_xy)
-        self.pid_z = PID(kp_z,  ki_z,  kd_z)
+        self.pid_x   = PID(kp_xy,  ki_xy,  kd_xy)
+        self.pid_y   = PID(kp_xy,  ki_xy,  kd_xy)
+        self.pid_z   = PID(kp_z,   ki_z,   kd_z)
+        self.pid_yaw = PID(kp_yaw, ki_yaw, kd_yaw, integral_limit=30.0)
 
         # ── Control events ────────────────────────────────────────────────────
         self.stop_event = threading.Event()
 
     # ── Pose update (called from NatNet thread) ───────────────────────────────
-    def update_pose(self, position):
-        """NatNet streams as (y, z, x) — remap to world frame."""
+    def update_pose(self, position, rotation):
+        """
+        NatNet streams position as (y, z, x) and rotation as quaternion (qx, qy, qz, qw).
+        Remap position to world frame and extract yaw from quaternion.
+        """
+        qx, qy, qz, qw = rotation
+        yaw = quat_to_yaw(qx, qy, qz, qw)
         with self.pose_lock:
-            self.x = position[2]
-            self.y = position[0]
-            self.z = position[1]
+            self.x  = position[2]
+            self.y  = position[0]
+            self.z  = position[1]
+            self.qx, self.qy, self.qz, self.qw = qx, qy, qz, qw
+            self.yaw        = yaw
             self.pose_valid = True
 
     def get_pose(self):
         with self.pose_lock:
-            return self.x, self.y, self.z, self.pose_valid
+            return self.x, self.y, self.z, self.yaw, self.pose_valid
+
+    def get_orientation(self):
+        """Return full quaternion for extpose."""
+        with self.pose_lock:
+            return self.qx, self.qy, self.qz, self.qw
 
     # ── Nav helpers ───────────────────────────────────────────────────────────
     def set_target(self, x, y, z, queue=None):
@@ -176,7 +216,7 @@ class Drone:
     def get_nav(self):
         with self.nav_lock:
             return (self.target_x, self.target_y, self.target_z,
-                    self.should_land, list(self.waypoint_queue))
+                    self.target_yaw, self.should_land, list(self.waypoint_queue))
 
     def advance_waypoint(self):
         """Pop next waypoint from queue and set as target. Returns new target or None."""
@@ -191,22 +231,27 @@ class Drone:
         self.pid_x.reset()
         self.pid_y.reset()
         self.pid_z.reset()
+        self.pid_yaw.reset()
 
-    # ── extpos sender ─────────────────────────────────────────────────────────
+    # ── extpose sender (position + orientation) ───────────────────────────────
     def run_extpos(self, scf, stop_ep):
         dt = 1.0 / EXTPOS_HZ
         while not stop_ep.is_set():
             t0 = time.time()
-            x, y, z, valid = self.get_pose()
+            x, y, z, _, valid = self.get_pose()
+            qx, qy, qz, qw   = self.get_orientation()
             if valid:
-                scf.cf.extpos.send_extpos(x, y, z)
+                # send_extpose gives the EKF both position AND orientation
+                # so it knows the drone's heading from the start
+                scf.cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
             elapsed = time.time() - t0
             time.sleep(max(0, dt - elapsed))
 
     # ── Takeoff ───────────────────────────────────────────────────────────────
     def takeoff(self, scf):
         cf = scf.cf
-        print(f"[{self.name}]  Taking off to z={self.default_z}m ...")
+        print(f"[{self.name}]  Taking off to z={self.default_z}m  "
+              f"(holding yaw={self.home_yaw:.1f}deg) ...")
         for _ in range(10):
             cf.commander.send_velocity_world_setpoint(0, 0, 0, 0)
             time.sleep(0.01)
@@ -215,7 +260,7 @@ class Drone:
             if kill_event.is_set():
                 cf.commander.send_stop_setpoint()
                 return False
-            _, _, cz, _ = self.get_pose()
+            _, _, cz, _, _ = self.get_pose()
             if cz > CLAMP_Z_MAX:
                 print(f"[{self.name}]  ALTITUDE LIMIT HIT DURING TAKEOFF — killing!")
                 kill_event.set()
@@ -234,13 +279,13 @@ class Drone:
     def land(self, scf):
         cf = scf.cf
         print(f"\n[{self.name}]  Descending...")
-        _, _, cz, _ = self.get_pose()
+        _, _, cz, _, _ = self.get_pose()
         while cz > 0.10:
             if kill_event.is_set():
                 break
             cf.commander.send_velocity_world_setpoint(0, 0, -0.2, 0)
             time.sleep(0.05)
-            _, _, cz, _ = self.get_pose()
+            _, _, cz, _, _ = self.get_pose()
         cf.commander.send_stop_setpoint()
         time.sleep(0.3)
         try:
@@ -267,7 +312,7 @@ class Drone:
         ep = threading.Thread(
             target=self.run_extpos, args=(scf, stop_ep), daemon=True)
         ep.start()
-        print(f"[{self.name}]  extpos started. Waiting for MoCap data...")
+        print(f"[{self.name}]  extpose started. Waiting for MoCap data...")
         time.sleep(1.0)
 
         cf.param.set_value('kalman.resetEstimation', '1')
@@ -288,19 +333,19 @@ class Drone:
             while not self.stop_event.is_set() and not kill_event.is_set():
                 loop_start = time.time()
 
-                tx, ty, tz, should_land, queue = self.get_nav()
+                tx, ty, tz, target_yaw, should_land, queue = self.get_nav()
                 if should_land:
                     break
 
-                cx, cy, cz, got_data = self.get_pose()
+                cx, cy, cz, cyaw, got_data = self.get_pose()
                 queue_len = len(queue)
 
                 # ── Drift safety net — graceful land if drone escapes volume ──
                 # Targets are pre-clamped; this only catches unexpected physical drift.
                 out_of_bounds = (
-                    cx < CLAMP_X_MIN-0.1 or cx > CLAMP_X_MAX+0.1 or
-                    cy < CLAMP_Y_MIN-0.1 or cy > CLAMP_Y_MAX+0.1 or
-                    cz < CLAMP_Z_MIN-0.1 or cz > CLAMP_Z_MAX+0.1
+                    cx < CLAMP_X_MIN - 0.1 or cx > CLAMP_X_MAX + 0.1 or
+                    cy < CLAMP_Y_MIN - 0.1 or cy > CLAMP_Y_MAX + 0.1 or
+                    cz < CLAMP_Z_MIN - 0.1 or cz > CLAMP_Z_MAX + 0.1
                 )
                 if out_of_bounds:
                     print(f"\n[{self.name}]  !! OUT OF BOUNDS "
@@ -321,7 +366,12 @@ class Drone:
                 vy = clamp(self.pid_y.update(ey, now), MAX_SPEED)
                 vz = clamp(self.pid_z.update(ez, now), MAX_SPEED)
 
-                cf.commander.send_velocity_world_setpoint(vx, vy, vz, 0)
+                # ── Yaw PID — hold home heading ───────────────────────────────
+                # wrap_angle ensures we always take the shortest rotation path
+                yaw_error    = wrap_angle(target_yaw - cyaw)
+                yaw_rate_cmd = clamp(self.pid_yaw.update(yaw_error, now), MAX_YAW_RATE)
+
+                cf.commander.send_velocity_world_setpoint(vx, vy, vz, yaw_rate_cmd)
 
                 dist    = (ex**2 + ey**2 + ez**2) ** 0.5
                 arrived = dist < ARRIVAL_RADIUS
@@ -338,6 +388,7 @@ class Drone:
                 queue_str = f"  queue={queue_len}" if queue_len > 0 else ""
                 with status_lock:
                     print(f"  [{self.name}] pos=({cx:+.3f},{cy:+.3f},{cz:+.3f})  "
+                          f"yaw={cyaw:+.1f}deg  "
                           f"tgt=grid{nearest[0]:>2}({tx:+.3f},{ty:+.3f},{tz:+.3f})  "
                           f"dist={dist:.3f}m  "
                           f"{'[ARRIVED]' if arrived and queue_len == 0 else '         '}"
@@ -362,42 +413,47 @@ class Drone:
 #
 #   ACTIVE DRONES — comment out any drone you don't want to fly
 #
-#   Drone(number, marker_id, default_z, kp_xy, ki_xy, kd_xy, kp_z, ki_z, kd_z)
+#   Drone(number, marker_id, default_z,
+#         kp_xy, ki_xy, kd_xy,
+#         kp_z,  ki_z,  kd_z,
+#         kp_yaw, ki_yaw, kd_yaw)
 #
 #   number    : 1-8  (also used to build URI: E7E7E7E70<number>)
 #   marker_id : Motive streaming ID  (351 for Drone1, 352 for Drone2, etc.)
 #   default_z : takeoff and hover height in metres
-#   PID gains : tune per drone if one flies differently from the others
-#               — leave at defaults if all drones are identical hardware
+#   PID gains : tune per drone if needed — leave at defaults for identical hardware
+#   yaw PID   : kp_yaw output is deg/s — increase kp_yaw if heading drifts slowly,
+#               decrease if it oscillates
 #
 # ══════════════════════════════════════════════════════════════════════════════
 ACTIVE_DRONES = [
 
-    # Drone(number=1, marker_id=351, default_z=0.5),
+    Drone(number=1, marker_id=351, default_z=0.5),
     # Drone(number=2, marker_id=352, default_z=0.5),
     # Drone(number=3, marker_id=353, default_z=0.5),
-    Drone(number=4, marker_id=354, default_z=0.5),
+    # Drone(number=4, marker_id=354, default_z=0.5),
     # Drone(number=5, marker_id=355, default_z=0.5),
     # Drone(number=6, marker_id=356, default_z=0.5),
     # Drone(number=7, marker_id=357, default_z=0.5),
     # Drone(number=8, marker_id=358, default_z=0.5),
 
-    # ── Custom PID example (heavier drone, needs more aggressive gains) ───────
+    # ── Custom PID example ────────────────────────────────────────────────────
     # Drone(number=4, marker_id=354, default_z=0.5,
     #       kp_xy=0.8, ki_xy=0.06, kd_xy=0.18,
-    #       kp_z=1.0,  ki_z=0.10,  kd_z=0.25),
+    #       kp_z=1.0,  ki_z=0.10,  kd_z=0.25,
+    #       kp_yaw=2.5, ki_yaw=0.05, kd_yaw=0.1),
 
 ]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 # ── NatNet rigid body callback ────────────────────────────────────────────────
-# Built in main() once ACTIVE_DRONES is known
 marker_to_drone = {}
 
 def receiveRigidBodyFrame(rb_id, position, rotation):
+    """rotation is (qx, qy, qz, qw) from NatNet."""
     if rb_id in marker_to_drone:
-        marker_to_drone[rb_id].update_pose(position)
+        marker_to_drone[rb_id].update_pose(position, rotation)
 
 # ── Path conflict check ───────────────────────────────────────────────────────
 def path_conflicts(sx, sy, tx, ty, ox, oy, radius):
@@ -412,13 +468,13 @@ def path_conflicts(sx, sy, tx, ty, ox, oy, radius):
 
 # ── Plan path with avoidance against all other active drones ─────────────────
 def plan_path(moving_drone, target_x, target_y, target_z):
-    cx, cy, cz, _ = moving_drone.get_pose()
+    cx, cy, cz, _, _ = moving_drone.get_pose()
     worst_z = None
 
     for drone in ACTIVE_DRONES:
         if drone is moving_drone:
             continue
-        ox, oy, oz, _ = drone.get_pose()
+        ox, oy, oz, _, _ = drone.get_pose()
         conflict       = path_conflicts(cx, cy, target_x, target_y,
                                         ox, oy, COLLISION_RADIUS)
         height_similar = abs(cz - oz) < HEIGHT_TOLERANCE
@@ -469,12 +525,13 @@ def sanity_check():
     print("  ║         PRE-FLIGHT SANITY CHECK          ║")
     print("  ╚══════════════════════════════════════════╝\n")
     for drone in ACTIVE_DRONES:
-        x, y, z, _ = drone.get_pose()
+        x, y, z, yaw, _ = drone.get_pose()
         print(f"  {drone.name} (marker {drone.marker_id})  "
-              f"x={x:+.3f}  y={y:+.3f}  z={z:+.3f}  (height={z:.3f}m)")
+              f"x={x:+.3f}  y={y:+.3f}  z={z:+.3f}  yaw={yaw:+.1f}deg")
     print()
-    print("  Z values should all be close to 0.0 (floor level).")
-    print("  Confirm each position matches where that drone is physically sitting.\n")
+    print("  Z values should be close to 0.0 (floor level).")
+    print("  Yaw shows the current heading each drone will hold during flight.")
+    print("  Confirm positions match where each drone is physically sitting.\n")
     confirm = input("  Do ALL positions match the physical drones? (yes/no): ").strip().lower()
     if confirm != 'yes':
         print("\n  [ABORT] Sanity check failed. Check marker IDs in ACTIVE_DRONES.\n")
@@ -484,13 +541,12 @@ def sanity_check():
 
 # ── Terminal input thread ─────────────────────────────────────────────────────
 def input_thread(status_lock):
-    n       = len(ACTIVE_DRONES)
     numbers = [d.number for d in ACTIVE_DRONES]
 
     print("\n  ── Commands ────────────────────────────────────────────────────")
     print(f"    <n> <grid> <z>  — drone N to grid at height  (e.g. 1 13 0.5)")
     print(f"    <n> home        — drone N return to takeoff spot")
-    print("    status          — print all positions and targets")
+    print("    status          — print all positions and headings")
     print("    grid            — print the grid map")
     print("    land            — land ALL drones")
     print("    land <n>        — land drone N only")
@@ -500,7 +556,6 @@ def input_thread(status_lock):
           f"z=[{CLAMP_Z_MIN},{CLAMP_Z_MAX}]")
     print("  ────────────────────────────────────────────────────────────────\n")
 
-    # Build number -> drone lookup
     drone_by_num = {d.number: d for d in ACTIVE_DRONES}
 
     while True:
@@ -533,7 +588,7 @@ def input_thread(status_lock):
                             drone_by_num[dn].should_land = True
                         print(f"  [NAV]  Landing Drone{dn}.")
                     else:
-                        print(f"  [ERR]  No active drone with number {dn}. Active: {numbers}")
+                        print(f"  [ERR]  No active drone {dn}. Active: {numbers}")
                 except ValueError:
                     print("  [ERR]  Usage: land  or  land <n>")
             continue
@@ -541,7 +596,7 @@ def input_thread(status_lock):
         if parts[0].lower() == "status":
             print()
             for drone in ACTIVE_DRONES:
-                cx, cy, cz, _ = drone.get_pose()
+                cx, cy, cz, cyaw, _ = drone.get_pose()
                 with drone.nav_lock:
                     tx, ty, tz = drone.target_x, drone.target_y, drone.target_z
                     q = len(drone.waypoint_queue)
@@ -549,6 +604,7 @@ def input_thread(status_lock):
                 nearest = min(GRID.items(),
                               key=lambda g: (g[1][0]-cx)**2 + (g[1][1]-cy)**2)
                 print(f"  [{drone.name}] pos=({cx:+.3f},{cy:+.3f},{cz:+.3f})  "
+                      f"yaw={cyaw:+.1f}deg (tgt={drone.home_yaw:+.1f})  "
                       f"tgt=grid{nearest[0]:>2}({tx:+.3f},{ty:+.3f},{tz:+.3f})  "
                       f"dist={dist:.3f}m  queue={q}")
             print()
@@ -627,7 +683,6 @@ def main():
     n = len(ACTIVE_DRONES)
     print(f"\n[INIT]   {n} drone(s) active: {[d.name for d in ACTIVE_DRONES]}")
 
-    # Build NatNet marker -> drone map
     for drone in ACTIVE_DRONES:
         marker_to_drone[drone.marker_id] = drone
 
@@ -657,13 +712,17 @@ def main():
         client.stop()
         return
 
-    # Save home positions
+    # Save home positions and capture initial yaw as the heading to hold
     for drone in ACTIVE_DRONES:
-        x, y, _, _ = drone.get_pose()
-        drone.home_x = x
-        drone.home_y = y
+        x, y, _, yaw, _ = drone.get_pose()
+        drone.home_x   = x
+        drone.home_y   = y
+        drone.home_yaw = yaw
         drone.set_target(x, y, drone.default_z)
-        print(f"[NAV]    {drone.name} home: x={x:+.3f} y={y:+.3f} z={drone.default_z}")
+        with drone.nav_lock:
+            drone.target_yaw = yaw   # hold this heading throughout flight
+        print(f"[NAV]    {drone.name} home: x={x:+.3f} y={y:+.3f} z={drone.default_z}  "
+              f"yaw={yaw:+.1f}deg (will hold this heading)")
 
     cflib.crtp.init_drivers()
     print("[CF]     Connecting to all drones...")
@@ -676,6 +735,7 @@ def main():
     print("  Ctrl+C   = Graceful land ALL drones   ")
     print(f"  Drones   = {n}                        ")
     print(f"  Volume   = +/-{CLAMP_X_MAX}m XY, {CLAMP_Z_MAX}m Z")
+    print("  Each drone holds its own initial heading")
     print("  ========================================\n")
 
     scf_list = []

@@ -3,8 +3,6 @@
 N-drone MoCap rigid body waypoint navigation.
 No flow deck required — position comes from OptiTrack rigid bodies.
 
-Drones always face +X axis direction.
-
 HOW TO USE:
   1. In the ACTIVE DRONES section below, comment/uncomment which drones to fly.
   2. Run the script — it auto-detects how many are active.
@@ -15,15 +13,15 @@ Controls:
   Ctrl+C         — Graceful land ALL drones
 
 Terminal commands (mid-flight):
-  <n> <grid> <z> — send drone N to grid position at height z  (e.g. 1 13 0.5)
-  <n> home       — drone N return to its physical takeoff spot
-  status         — print all drones position and target
-  grid           — print the full grid map
-  land           — graceful land all drones
-  land <n>       — graceful land drone N only
+  <n> <x> <y> <z> — send drone N to raw coordinates  (e.g. 1 0.5 -1.0 0.8)
+  <n> home         — drone N return to its physical takeoff spot
+  status           — print all drones position and target
+  grid             — print the full grid map with coordinates
+  land             — graceful land all drones
+  land <n>         — graceful land drone N only
 
 Obstacle avoidance:
-  When a drone's path passes through any other drone at similar height,
+  When a drone path passes through any other drone closer than SAFE_DIST,
   the moving drone automatically:
     Step 1 — climbs to blocking drone height + AVOID_OFFSET at current XY
     Step 2 — flies to target XY at avoid height
@@ -41,7 +39,7 @@ from pynput import keyboard
 
 logging.basicConfig(level=logging.ERROR)
 
-# ── Grid map ──────────────────────────────────────────────────────────────────
+# ── Grid map (reference only — printed for convenience) ───────────────────────
 GRID = {
      1: (-1.0, +1.0),   2: (-0.5, +1.0),   3: ( 0.0, +1.0),   4: (+0.5, +1.0),   5: (+1.0, +1.0),
      6: (-1.0, +0.5),   7: (-0.5, +0.5),   8: ( 0.0, +0.5),   9: (+0.5, +0.5),  10: (+1.0, +0.5),
@@ -54,11 +52,15 @@ GRID = {
 MAX_SPEED        = 0.3
 LOOP_HZ          = 50
 EXTPOS_HZ        = 100
-MAX_ALTITUDE     = 1.75
 ARRIVAL_RADIUS   = 0.08
-COLLISION_RADIUS = 0.15
-HEIGHT_TOLERANCE = 0.3    # z diff below which avoidance triggers
-AVOID_OFFSET     = 0.5    # climb this much above the blocking drone
+AVOID_OFFSET     = 0.5     # climb this much above the blocking drone (metres)
+HEIGHT_TOLERANCE = 0.3     # z diff below which avoidance triggers (metres)
+
+# ── Safe distance between drones ──────────────────────────────────────────────
+# If the straight-line path to a target passes within SAFE_DIST of another drone
+# (and they are at similar height), avoidance is triggered.
+# Increase to give more separation, decrease to allow drones to pass closer.
+SAFE_DIST = 0.10   # metres
 
 # ── Flight volume clamps — edit these 6 values to resize the allowed cube ─────
 # Commanded waypoints are clamped to this volume before being sent to the drone.
@@ -298,9 +300,9 @@ class Drone:
                 # ── Drift safety net — graceful land if drone escapes volume ──
                 # Targets are pre-clamped; this only catches unexpected physical drift.
                 out_of_bounds = (
-                    cx < CLAMP_X_MIN-0.1 or cx > CLAMP_X_MAX+0.1 or
-                    cy < CLAMP_Y_MIN-0.1 or cy > CLAMP_Y_MAX+0.1 or
-                    cz < CLAMP_Z_MIN-0.1 or cz > CLAMP_Z_MAX+0.1
+                    cx < CLAMP_X_MIN - 0.1 or cx > CLAMP_X_MAX + 0.1 or
+                    cy < CLAMP_Y_MIN - 0.1 or cy > CLAMP_Y_MAX + 0.1 or
+                    cz < CLAMP_Z_MIN - 0.1 or cz > CLAMP_Z_MAX + 0.1
                 )
                 if out_of_bounds:
                     print(f"\n[{self.name}]  !! OUT OF BOUNDS "
@@ -338,7 +340,8 @@ class Drone:
                 queue_str = f"  queue={queue_len}" if queue_len > 0 else ""
                 with status_lock:
                     print(f"  [{self.name}] pos=({cx:+.3f},{cy:+.3f},{cz:+.3f})  "
-                          f"tgt=grid{nearest[0]:>2}({tx:+.3f},{ty:+.3f},{tz:+.3f})  "
+                          f"tgt=({tx:+.3f},{ty:+.3f},{tz:+.3f})  "
+                          f"~grid{nearest[0]:>2}  "
                           f"dist={dist:.3f}m  "
                           f"{'[ARRIVED]' if arrived and queue_len == 0 else '         '}"
                           f"{queue_str}")
@@ -376,13 +379,13 @@ ACTIVE_DRONES = [
     # Drone(number=1, marker_id=351, default_z=0.5),
     # Drone(number=2, marker_id=352, default_z=0.5),
     # Drone(number=3, marker_id=353, default_z=0.5),
-    Drone(number=4, marker_id=354, default_z=0.5),
-    # Drone(number=5, marker_id=355, default_z=0.5),
+    # Drone(number=4, marker_id=354, default_z=0.5),
+    Drone(number=5, marker_id=355, default_z=0.5),
     # Drone(number=6, marker_id=356, default_z=0.5),
     # Drone(number=7, marker_id=357, default_z=0.5),
     # Drone(number=8, marker_id=358, default_z=0.5),
 
-    # ── Custom PID example (heavier drone, needs more aggressive gains) ───────
+    # ── Custom PID example ────────────────────────────────────────────────────
     # Drone(number=4, marker_id=354, default_z=0.5,
     #       kp_xy=0.8, ki_xy=0.06, kd_xy=0.18,
     #       kp_z=1.0,  ki_z=0.10,  kd_z=0.25),
@@ -392,7 +395,6 @@ ACTIVE_DRONES = [
 
 
 # ── NatNet rigid body callback ────────────────────────────────────────────────
-# Built in main() once ACTIVE_DRONES is known
 marker_to_drone = {}
 
 def receiveRigidBodyFrame(rb_id, position, rotation):
@@ -401,6 +403,7 @@ def receiveRigidBodyFrame(rb_id, position, rotation):
 
 # ── Path conflict check ───────────────────────────────────────────────────────
 def path_conflicts(sx, sy, tx, ty, ox, oy, radius):
+    """True if line segment (sx,sy)->(tx,ty) passes within radius of (ox,oy)."""
     dx, dy = tx - sx, ty - sy
     seg_sq = dx*dx + dy*dy
     if seg_sq == 0:
@@ -420,7 +423,7 @@ def plan_path(moving_drone, target_x, target_y, target_z):
             continue
         ox, oy, oz, _ = drone.get_pose()
         conflict       = path_conflicts(cx, cy, target_x, target_y,
-                                        ox, oy, COLLISION_RADIUS)
+                                        ox, oy, SAFE_DIST)
         height_similar = abs(cz - oz) < HEIGHT_TOLERANCE
         if conflict and height_similar:
             if worst_z is None or oz > worst_z:
@@ -484,23 +487,22 @@ def sanity_check():
 
 # ── Terminal input thread ─────────────────────────────────────────────────────
 def input_thread(status_lock):
-    n       = len(ACTIVE_DRONES)
     numbers = [d.number for d in ACTIVE_DRONES]
 
     print("\n  ── Commands ────────────────────────────────────────────────────")
-    print(f"    <n> <grid> <z>  — drone N to grid at height  (e.g. 1 13 0.5)")
-    print(f"    <n> home        — drone N return to takeoff spot")
-    print("    status          — print all positions and targets")
-    print("    grid            — print the grid map")
-    print("    land            — land ALL drones")
-    print("    land <n>        — land drone N only")
-    print(f"    Active drones: {numbers}")
-    print(f"    Volume: x=[{CLAMP_X_MIN},{CLAMP_X_MAX}]  "
-          f"y=[{CLAMP_Y_MIN},{CLAMP_Y_MAX}]  "
-          f"z=[{CLAMP_Z_MIN},{CLAMP_Z_MAX}]")
+    print(f"    <n> <x> <y> <z>  — drone N to raw coords  (e.g. 1 0.5 -1.0 0.8)")
+    print(f"    <n> home          — drone N return to takeoff spot")
+    print("    status            — print all positions and targets")
+    print("    grid              — print the grid map for reference")
+    print("    land              — land ALL drones")
+    print("    land <n>          — land drone N only")
+    print(f"    Active drones  : {numbers}")
+    print(f"    Safe distance  : {SAFE_DIST}m  (avoidance triggers within this)")
+    print(f"    Volume x       : [{CLAMP_X_MIN}, {CLAMP_X_MAX}]")
+    print(f"    Volume y       : [{CLAMP_Y_MIN}, {CLAMP_Y_MAX}]")
+    print(f"    Volume z       : [{CLAMP_Z_MIN}, {CLAMP_Z_MAX}]")
     print("  ────────────────────────────────────────────────────────────────\n")
 
-    # Build number -> drone lookup
     drone_by_num = {d.number: d for d in ACTIVE_DRONES}
 
     while True:
@@ -533,7 +535,7 @@ def input_thread(status_lock):
                             drone_by_num[dn].should_land = True
                         print(f"  [NAV]  Landing Drone{dn}.")
                     else:
-                        print(f"  [ERR]  No active drone with number {dn}. Active: {numbers}")
+                        print(f"  [ERR]  No active drone {dn}. Active: {numbers}")
                 except ValueError:
                     print("  [ERR]  Usage: land  or  land <n>")
             continue
@@ -549,8 +551,8 @@ def input_thread(status_lock):
                 nearest = min(GRID.items(),
                               key=lambda g: (g[1][0]-cx)**2 + (g[1][1]-cy)**2)
                 print(f"  [{drone.name}] pos=({cx:+.3f},{cy:+.3f},{cz:+.3f})  "
-                      f"tgt=grid{nearest[0]:>2}({tx:+.3f},{ty:+.3f},{tz:+.3f})  "
-                      f"dist={dist:.3f}m  queue={q}")
+                      f"tgt=({tx:+.3f},{ty:+.3f},{tz:+.3f})  "
+                      f"~grid{nearest[0]:>2}  dist={dist:.3f}m  queue={q}")
             print()
             continue
 
@@ -569,8 +571,8 @@ def input_thread(status_lock):
             print(f"  [NAV]  Drone{dn} -> Home ({d.home_x:+.3f},{d.home_y:+.3f},{d.default_z})")
             continue
 
-        # <n> <grid> <z>
-        if len(parts) == 3:
+        # <n> <x> <y> <z>
+        if len(parts) == 4:
             try:
                 dn = int(parts[0])
             except ValueError:
@@ -581,22 +583,14 @@ def input_thread(status_lock):
                 continue
 
             try:
-                grid_num = int(parts[1])
+                tx = float(parts[1])
+                ty = float(parts[2])
+                tz = float(parts[3])
             except ValueError:
-                print("  [ERR]  Grid must be a whole number 1-25")
-                continue
-            if grid_num not in GRID:
-                print(f"  [ERR]  Grid {grid_num} not valid — use 1 to 25")
+                print("  [ERR]  x y z must all be numbers  (e.g. 1 0.5 -1.0 0.8)")
                 continue
 
-            try:
-                tz = float(parts[2])
-            except ValueError:
-                print("  [ERR]  Height must be a number  (e.g. 1 13 0.5)")
-                continue
-
-            tx, ty = GRID[grid_num]
-            # Clamp the commanded target to the allowed flight volume
+            # Clamp to flight volume
             orig = (tx, ty, tz)
             tx, ty, tz = clamp_target(tx, ty, tz)
             if (tx, ty, tz) != orig:
@@ -608,26 +602,26 @@ def input_thread(status_lock):
             waypoints, avoided = plan_path(moving, tx, ty, tz)
 
             if avoided:
-                print(f"  [NAV]   Drone{dn} -> Grid {grid_num} at z={tz}m")
-                print(f"  [AVOID] Path conflict detected")
+                print(f"  [NAV]   Drone{dn} -> ({tx:+.3f},{ty:+.3f},{tz:.3f})")
+                print(f"  [AVOID] Path within SAFE_DIST={SAFE_DIST}m of another drone")
                 print(f"  [AVOID] Step 1: climb to z={waypoints[0][2]:.2f}m at current XY")
-                print(f"  [AVOID] Step 2: fly to Grid {grid_num} at z={waypoints[1][2]:.2f}m")
+                print(f"  [AVOID] Step 2: fly to ({tx:+.3f},{ty:+.3f}) at z={waypoints[1][2]:.2f}m")
                 print(f"  [AVOID] Step 3: descend to z={waypoints[2][2]:.2f}m")
             else:
-                print(f"  [NAV]  Drone{dn} -> Grid {grid_num:>2} ({tx:+.3f},{ty:+.3f}) at z={tz}m")
+                print(f"  [NAV]  Drone{dn} -> ({tx:+.3f},{ty:+.3f},{tz:.3f})")
 
             moving.set_target(waypoints[0][0], waypoints[0][1], waypoints[0][2],
                               queue=waypoints[1:])
             continue
 
-        print("  [ERR]  Unknown command. Examples:  1 13 0.5  /  2 home  /  status  /  land")
+        print("  [ERR]  Unknown command. Examples:  1 0.5 -1.0 0.8  /  2 home  /  status  /  land")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     n = len(ACTIVE_DRONES)
     print(f"\n[INIT]   {n} drone(s) active: {[d.name for d in ACTIVE_DRONES]}")
+    print(f"[INIT]   Safe distance = {SAFE_DIST}m")
 
-    # Build NatNet marker -> drone map
     for drone in ACTIVE_DRONES:
         marker_to_drone[drone.marker_id] = drone
 
@@ -657,7 +651,6 @@ def main():
         client.stop()
         return
 
-    # Save home positions
     for drone in ACTIVE_DRONES:
         x, y, _, _ = drone.get_pose()
         drone.home_x = x
@@ -675,6 +668,7 @@ def main():
     print("  CTRL+X   = Emergency kill ALL drones  ")
     print("  Ctrl+C   = Graceful land ALL drones   ")
     print(f"  Drones   = {n}                        ")
+    print(f"  Safe dist= {SAFE_DIST}m               ")
     print(f"  Volume   = +/-{CLAMP_X_MAX}m XY, {CLAMP_Z_MAX}m Z")
     print("  ========================================\n")
 
