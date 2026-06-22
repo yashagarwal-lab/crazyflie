@@ -18,9 +18,14 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.crazyflie.log import LogConfig
 from NatNetClient import NatNetClient
-from pynput import keyboard
+try:
+    from pynput import keyboard
+    HAS_PYNPUT = True
+except ImportError:
+    HAS_PYNPUT = False
 from core.state import DroneState
-from core.pipeline import MellingerController, CBFSafetyWrapper, CBFSafetyFilter
+from core.pipeline import MellingerController, CBFSafetyWrapper
+from core.cbf import CBFSafetyFilter
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -82,9 +87,9 @@ class Drone:
         # If config requests CBF, wrap it
         if config.get('use_cbf', False):
             cbf_filter = CBFSafetyFilter(
-                v_max=MAX_SPEED, 
-                r_safe=0.3, # Collision radius
-                workspace_radius=WORKSPACE_RADIUS,
+                max_speed=MAX_SPEED, 
+                d_min=0.3, # Collision radius
+                radius=WORKSPACE_RADIUS,
                 z_min=WORKSPACE_Z_MIN,
                 z_max=WORKSPACE_Z_MAX
             )
@@ -357,9 +362,12 @@ class SwarmController:
             self.kill_event.set()
 
     def start_kill_listener(self):
-        listener = keyboard.Listener(on_press=self.on_press)
-        listener.daemon = True
-        listener.start()
+        if HAS_PYNPUT:
+            listener = keyboard.Listener(on_press=self.on_press)
+            listener.daemon = True
+            listener.start()
+        else:
+            self.log("[WARN] pynput not installed. Emergency CTRL+X is disabled.")
 
     def sanity_check(self):
         print("\n  ╔══════════════════════════════════════════╗")
@@ -384,7 +392,7 @@ class SwarmController:
 
         timeout = time.time() + 10.0
         while True:
-            missing = [d.name for d in self.drones if not d.pose_valid]
+            missing = [d.name for d in self.drones if not d.drone_state.pose_valid]
             if not missing: break
             if time.time() > timeout:
                 self.log(f"[MoCap] ERROR: Cannot see: {missing}")
