@@ -67,6 +67,30 @@ class CBFSafetyWrapper(BaseController):
         self.all_drones_provider = all_drones_provider # Function returning a list of all DroneState objects
         self.max_speed = getattr(base_controller, 'max_speed', 1.0)
         
+    @property
+    def setpoint_x(self):
+        return self.base_controller.setpoint_x
+
+    @setpoint_x.setter
+    def setpoint_x(self, value):
+        self.base_controller.setpoint_x = value
+
+    @property
+    def setpoint_y(self):
+        return self.base_controller.setpoint_y
+
+    @setpoint_y.setter
+    def setpoint_y(self, value):
+        self.base_controller.setpoint_y = value
+
+    @property
+    def setpoint_z(self):
+        return self.base_controller.setpoint_z
+
+    @setpoint_z.setter
+    def setpoint_z(self, value):
+        self.base_controller.setpoint_z = value
+
     def compute(self, state, target_pos, target_yaw, dt):
         cx, cy, cz = state.get_position()
         

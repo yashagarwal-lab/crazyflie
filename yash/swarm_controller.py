@@ -318,7 +318,7 @@ class Drone:
 
         if self.controller.kill_event.is_set():
             cf.commander.send_stop_setpoint()
-            self.state = "KILLED"
+            self.drone_state.status = "KILLED"
         else:
             self.land(scf)
 

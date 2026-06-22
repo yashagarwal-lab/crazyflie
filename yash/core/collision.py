@@ -39,7 +39,7 @@ class CollisionAvoider:
                 continue
 
             # Check against current position
-            ox, oy, oz, _ = d.get_pose()
+            ox, oy, oz, _, _, _, _, _ = d.get_pose()
             x, y, z = self._push_apart(x, y, z, ox, oy, oz)
 
             # Check against other drone's current target
